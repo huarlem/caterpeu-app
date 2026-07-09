@@ -16,7 +16,7 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.0.0';
+const APP_VERSION = 'v1.1.0';
 
 /* ---------------------------------------------------------------------- *
  * Ícones (SVG inline, fiéis ao design)
@@ -195,7 +195,7 @@ const state = {
     nfMessage: 'Avise o cliente que o valor aumentará {percentual}% para emissão de Nota Fiscal.',
     pagMessage: 'Avise o cliente que só trabalhamos à vista.',
     payMethods: { dinheiro: true, pix: true, cartao: true, cheque: true },
-    valorHoraSugerido: null
+    valorHoraSugerido: 250
   },
   pinApiUrl: '',
   apiUrl: '',
@@ -1348,7 +1348,7 @@ function screenHtml() {
 
 function footerHtml() {
   if (state.screen === 'user-setup') return '';
-  return `<div class="app-footer">${esc(COMPANY.name)} · ${esc(APP_VERSION)}</div>`;
+  return `<div class="app-footer">Desenvolvido por Huarlem Lima · ${esc(APP_VERSION)}</div>`;
 }
 
 let _lastFocus = null;
