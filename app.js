@@ -16,7 +16,7 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.3.0';
+const APP_VERSION = 'v1.4.0';
 
 /* ---------------------------------------------------------------------- *
  * Ícones (SVG inline, fiéis ao design)
@@ -1010,7 +1010,6 @@ function svcCardFinalizado(s) {
       </div>
       <div style="display:flex;gap:8px;">
         <button class="btn-sm btn-outline-solid" data-action="open-nota" data-id="${s.id}">Ver nota</button>
-        <button class="btn-sm btn-whats" data-action="send-whats" data-id="${s.id}">WhatsApp</button>
       </div>
     </div>
   </div>`;
