@@ -131,6 +131,12 @@ button{-webkit-appearance:none;appearance:none;}
 .photo-small{width:100%;height:96px;border-radius:10px;overflow:hidden;background:var(--fieldBg);border:1px solid #eceae4;}
 .photo-small img{width:100%;height:100%;object-fit:cover;}
 
+.photo-choice-row{display:flex;gap:10px;}
+.photo-choice-btn{flex:1;height:96px;border-radius:12px;border:1.5px dashed var(--line);background:var(--fieldBg);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;cursor:pointer;color:var(--inkSoft);
+  font-size:12.5px;font-weight:700;}
+.photo-choice-btn:active{background:var(--chipBg);color:var(--chipInk);border-color:var(--accent);}
+
 /* ---------- Cards genéricos ---------- */
 .card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:var(--shadow);}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1px;margin-top:18px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;}

@@ -16,7 +16,7 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.1.0';
+const APP_VERSION = 'v1.2.0';
 
 /* ---------------------------------------------------------------------- *
  * Ícones (SVG inline, fiéis ao design)
@@ -40,6 +40,7 @@ const ICON = {
   warn: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 9v4m0 4h.01M10.3 3.9L2.7 17a2 2 0 001.7 3h15.2a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   toastCheck: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="#F5A623" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   camera: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M4 8a2 2 0 012-2h1.2l.9-1.5A2 2 0 0110 3.5h4a2 2 0 011.9 1L16.8 6H18a2 2 0 012 2v10a2 2 0 01-2 2H6a2 2 0 01-2-2V8z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.5" stroke="currentColor" stroke-width="1.8"/></svg>',
+  gallery: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.8"/><circle cx="8.5" cy="9.5" r="1.6" stroke="currentColor" stroke-width="1.6"/><path d="M21 16l-5.5-5.5-4 4-2.5-2.5L3 17.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   trash: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2m2 0-1 13a1 1 0 01-1 1H8a1 1 0 01-1-1L6 7h12z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 };
 
@@ -353,9 +354,14 @@ function fileToCompressedDataURL(file) {
   });
 }
 
-function openPhotoPicker(target) {
+function openPhotoPicker(target, useCamera) {
   state.pendingPhotoTarget = target;
-  document.getElementById('photo-input').click();
+  const input = document.getElementById('photo-input');
+  // alterna o atributo "capture" na hora: com ele, o celular abre a câmera direto;
+  // sem ele, abre o seletor de arquivos/galeria. Um único input reaproveitado para os dois casos.
+  if (useCamera) input.setAttribute('capture', 'environment');
+  else input.removeAttribute('capture');
+  input.click();
 }
 
 async function handlePhotoInputChange(e) {
@@ -909,10 +915,15 @@ function homeScreen() {
 }
 
 function photoSlotHtml(id, dataUrl, label, targetAction) {
-  return `<div class="photo-slot ${dataUrl ? 'filled' : ''}" data-action="${targetAction}">
-    ${dataUrl ? `<img src="${dataUrl}" alt="">` : ''}
-    <span class="lbl">${ICON.camera}<br>${esc(label)}</span>
-    ${dataUrl ? `<button class="remove-btn" data-action="${targetAction}-remove" title="Remover">${ICON.trash}</button>` : ''}
+  if (dataUrl) {
+    return `<div class="photo-slot filled">
+      <img src="${dataUrl}" alt="">
+      <button class="remove-btn" data-action="${targetAction}-remove" title="Remover">${ICON.trash}</button>
+    </div>`;
+  }
+  return `<div class="photo-choice-row">
+    <button class="photo-choice-btn" data-action="${targetAction}-camera">${ICON.camera}<span>Tirar foto</span></button>
+    <button class="photo-choice-btn" data-action="${targetAction}-gallery">${ICON.gallery}<span>Galeria</span></button>
   </div>`;
 }
 
@@ -1500,9 +1511,12 @@ function bindEvents() {
         break;
       }
       case 'rename-user': state.userNameInput = state.userName || ''; state.userSetupReturnScreen = 'config'; state.screen = 'user-setup'; render(); break;
-      case 'photo-form': openPhotoPicker('form'); break;
-      case 'photo-close': openPhotoPicker('close'); break;
-      case 'photo-form-fim': openPhotoPicker('form-fim'); break;
+      case 'photo-form-camera': openPhotoPicker('form', true); break;
+      case 'photo-form-gallery': openPhotoPicker('form', false); break;
+      case 'photo-close-camera': openPhotoPicker('close', true); break;
+      case 'photo-close-gallery': openPhotoPicker('close', false); break;
+      case 'photo-form-fim-camera': openPhotoPicker('form-fim', true); break;
+      case 'photo-form-fim-gallery': openPhotoPicker('form-fim', false); break;
       case 'photo-form-remove': e.stopPropagation(); state.formPhotoIni = null; render(); break;
       case 'photo-close-remove': e.stopPropagation(); state.closePhotoFim = null; render(); break;
       case 'photo-form-fim-remove': e.stopPropagation(); state.formPhotoFim = null; render(); break;
