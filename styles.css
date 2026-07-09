@@ -193,6 +193,9 @@ button{-webkit-appearance:none;appearance:none;}
 /* ---------- Estilo global de labels de campo ---------- */
 .section-label{display:block;font-size:13px;font-weight:700;color:var(--inkSoft);margin-bottom:9px;}
 
+/* ---------- Rodapé (versão do app) ---------- */
+.app-footer{text-align:center;font-size:11px;color:var(--inkSoft);padding:14px 0 22px;opacity:.6;}
+
 /* ---------- Área de impressão (fora da tela normalmente) ---------- */
 #print-area{position:absolute;left:-9999px;top:0;width:480px;}
 

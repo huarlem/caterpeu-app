@@ -15,6 +15,9 @@ const COMPANY = {
   region: 'Martinho Campos-MG · Abaeté-MG · Pompeu-MG'
 };
 
+/* Versão exibida no rodapé — incrementar a cada novo deploy. */
+const APP_VERSION = 'v1.0.0';
+
 /* ---------------------------------------------------------------------- *
  * Ícones (SVG inline, fiéis ao design)
  * ---------------------------------------------------------------------- */
@@ -66,8 +69,10 @@ function baseTotalOf(s) {
 }
 function totalOf(s) {
   const base = baseTotalOf(s);
-  if (s.nf && s.nfPercent) return base * (1 + s.nfPercent / 100);
-  return base;
+  let total = base;
+  if (s.nf && s.nfPercent) total = base * (1 + s.nfPercent / 100);
+  if (s.desconto) total = Math.max(0, total - s.desconto);
+  return total;
 }
 function nowLabel() {
   const d = new Date();
@@ -100,7 +105,8 @@ function diffSummary(before, after, labels) {
 const SERVICE_FIELD_LABELS = {
   client: 'Cliente', contact: 'Telefone', tipo: 'Tipo', maquina: 'Máquina', valor: 'Valor',
   horInicial: 'Horímetro/km inicial', horFinal: 'Horímetro/km final', diarias: 'Diárias',
-  local: 'Local', nf: 'Nota Fiscal', pagamento: 'Pagamento', status: 'Status', pago: 'Pago'
+  local: 'Local', nf: 'Nota Fiscal', pagamento: 'Pagamento', status: 'Status', pago: 'Pago',
+  desconto: 'Desconto'
 };
 function fmtDateTime(iso) {
   if (!iso) return '';
@@ -198,23 +204,26 @@ const state = {
   services: [],
   logs: [],
   syncQueue: [],
+  gapJustifications: [],
+  _gapDrafts: {},
 
-  configPassInput: '', configUnlockError: null,
+  configPassInput: '', configUnlockError: null, _configBefore: null,
   lastExportFilename: '',
 
   finFilter: 'todos',
   logFilterFrom: '', logFilterTo: '',
 
-  form: { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', local: '', nf: false, pagamento: '' },
+  form: { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', horimetroFinal: '', diarias: '', desconto: '', local: '', nf: false, pagamento: '' },
   formPhotoIni: null,
-  closeForm: { horimetroFinal: '', diarias: '' },
+  formPhotoFim: null,
+  closeForm: { horimetroFinal: '', diarias: '', desconto: '', nf: false },
   closePhotoFim: null,
 
-  pendingPhotoTarget: null // 'form' | 'close'
+  pendingPhotoTarget: null // 'form' | 'close' | 'form-fim'
 };
 
 function emptyForm() {
-  return { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', local: '', nf: false, pagamento: '' };
+  return { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', horimetroFinal: '', diarias: '', desconto: '', local: '', nf: false, pagamento: '' };
 }
 
 /* ---------------------------------------------------------------------- *
@@ -357,6 +366,7 @@ async function handlePhotoInputChange(e) {
     const dataUrl = await fileToCompressedDataURL(file);
     if (state.pendingPhotoTarget === 'form') state.formPhotoIni = dataUrl;
     else if (state.pendingPhotoTarget === 'close') state.closePhotoFim = dataUrl;
+    else if (state.pendingPhotoTarget === 'form-fim') state.formPhotoFim = dataUrl;
     render();
   } catch (err) {
     showToast('Não foi possível carregar a foto');
@@ -461,6 +471,7 @@ function vm(s) {
     nfExtraFmt: fmtBRL(baseTotalOf(s) * ((s.nfPercent || 0) / 100)),
     fotoInicial: s.fotoInicial || null, fotoFinal: s.fotoFinal || null,
     notaNumero: s.notaNumero || String(s.id).padStart(4, '0'),
+    desconto: s.desconto || 0, descontoFmt: fmtBRL(s.desconto || 0),
     raw: s
   };
 }
@@ -512,12 +523,19 @@ async function submitConfigPassword() {
 }
 function unlockConfig() {
   state.screen = 'config'; state.configPassInput = ''; state.configUnlockError = null; state.configChecking = false;
+  state._configBefore = null; // força capturar um novo "antes" ao entrar na tela
   addLog('Acesso às configurações');
   render();
 }
 
 function saveConfig() {
-  const beforeCfg = { nfPercent: state.config.nfPercent, valorHoraSugerido: state.config.valorHoraSugerido, ...state.config.payMethods };
+  // Os campos de config são vinculados diretamente ao state (ligação em tempo real),
+  // então o "antes" precisa ter sido capturado ao ABRIR a tela (ver configScreen()),
+  // nunca aqui — senão o "antes" já estaria igual ao "depois".
+  const snap = state._configBefore;
+  const beforeCfg = snap
+    ? { nfPercent: snap.nfPercent, valorHoraSugerido: snap.valorHoraSugerido, ...snap.payMethods }
+    : { nfPercent: state.config.nfPercent, valorHoraSugerido: state.config.valorHoraSugerido, ...state.config.payMethods };
 
   const p = num(String(state.config.nfPercent));
   state.config.nfPercent = isNaN(p) ? 0 : p;
@@ -544,6 +562,7 @@ function saveConfig() {
   const changes = diffSummary(beforeCfg, afterCfg, { nfPercent: 'Acréscimo NF (%)', valorHoraSugerido: 'Valor/hora sugerido', dinheiro: 'Dinheiro', pix: 'Pix', cartao: 'Cartão', cheque: 'Cheque' });
 
   saveMeta('config', state.config);
+  state._configBefore = null;
   state.screen = 'home';
   showToast('Configurações salvas');
   addLog('Configurações atualizadas', changes);
@@ -559,19 +578,24 @@ function openNovo() {
     state.form.valor = fmtDecimalInput(state.config.valorHoraSugerido);
   }
   state.formPhotoIni = null;
+  state.formPhotoFim = null;
   state.screen = 'novo';
   render();
 }
 function openEditar(id) {
   const svc = state.services.find((x) => x.id === id); if (!svc) return;
-  state.editingId = id; state.screen = 'editar';
+  state.editingId = id; state.selectedId = id; state.screen = 'editar';
   state.form = {
     client: svc.client, contact: svc.contact || '', tipo: svc.tipo, maquina: svc.maquina || 'retro',
     valor: svc.valor != null ? String(svc.valor).replace('.', ',') : '',
     horimetro: svc.horInicial != null ? String(svc.horInicial).replace('.', ',') : '',
+    horimetroFinal: svc.horFinal != null ? String(svc.horFinal).replace('.', ',') : '',
+    diarias: svc.diarias != null ? String(svc.diarias).replace('.', ',') : '',
+    desconto: svc.desconto ? String(svc.desconto).replace('.', ',') : '',
     local: svc.local || '', nf: !!svc.nf, pagamento: svc.pagamento || ''
   };
   state.formPhotoIni = svc.fotoInicial || null;
+  state.formPhotoFim = svc.fotoFinal || null;
   render();
 }
 function startService() {
@@ -597,29 +621,56 @@ function saveEdit() {
   if (!f.client.trim() || isNaN(valor)) { showToast('Preencha cliente e valor'); return; }
   const idx = state.services.findIndex((x) => x.id === id); if (idx === -1) return;
   const x = state.services[idx];
+  const isFechado = x.status === 'fechado';
+  const horInicial = (f.tipo === 'fechado') ? null : num(f.horimetro);
+
+  let horFinal = x.horFinal, diarias = x.diarias, desconto = x.desconto || 0;
+  if (isFechado) {
+    if (f.tipo === 'hora') {
+      const hf = num(f.horimetroFinal);
+      if (isNaN(hf)) { showToast('Informe o horímetro/km final'); return; }
+      if (hf < horInicial) { showToast(f.maquina === 'caminhao' ? 'Km final não pode ser menor que o inicial' : 'Horímetro final não pode ser menor que o inicial'); return; }
+      if (!state.formPhotoIni || !state.formPhotoFim) { showToast('Foto inicial e final são obrigatórias'); return; }
+      horFinal = hf;
+    } else if (f.tipo === 'diaria') {
+      const d = num(f.diarias);
+      if (isNaN(d)) { showToast('Informe as diárias'); return; }
+      diarias = d;
+    }
+    const desc = num(f.desconto);
+    desconto = isNaN(desc) ? 0 : desc;
+  }
+
   const updated = {
     ...x, client: f.client.trim(), contact: f.contact.trim(), tipo: f.tipo, maquina: f.maquina || 'retro', valor,
-    horInicial: (f.tipo === 'fechado') ? null : num(f.horimetro), local: f.local.trim(),
-    nf: !!f.nf, nfPercent: f.nf ? (x.nfPercent || state.config.nfPercent) : null, pagamento: f.pagamento,
+    horInicial, local: f.local.trim(),
+    nf: !!f.nf, nfPercent: f.nf ? state.config.nfPercent : null, pagamento: f.pagamento,
     fotoInicial: state.formPhotoIni || x.fotoInicial || null
   };
+  if (isFechado) {
+    updated.horFinal = horFinal;
+    updated.diarias = diarias;
+    updated.desconto = desconto;
+    updated.fotoFinal = state.formPhotoFim || x.fotoFinal || null;
+  }
 
-  const before = { client: x.client, contact: x.contact, tipo: x.tipo, maquina: x.maquina, valor: x.valor, horInicial: x.horInicial, local: x.local, nf: x.nf, pagamento: x.pagamento };
-  const after = { client: updated.client, contact: updated.contact, tipo: updated.tipo, maquina: updated.maquina, valor: updated.valor, horInicial: updated.horInicial, local: updated.local, nf: updated.nf, pagamento: updated.pagamento };
+  const before = { client: x.client, contact: x.contact, tipo: x.tipo, maquina: x.maquina, valor: x.valor, horInicial: x.horInicial, horFinal: x.horFinal, diarias: x.diarias, desconto: x.desconto, local: x.local, nf: x.nf, pagamento: x.pagamento };
+  const after = { client: updated.client, contact: updated.contact, tipo: updated.tipo, maquina: updated.maquina, valor: updated.valor, horInicial: updated.horInicial, horFinal: updated.horFinal, diarias: updated.diarias, desconto: updated.desconto, local: updated.local, nf: updated.nf, pagamento: updated.pagamento };
   const changes = diffSummary(before, after, SERVICE_FIELD_LABELS);
 
   state.services[idx] = updated;
   persistService(updated);
   queueSync('service_updated', updated);
-  state.selectedId = id; state.screen = 'detalhe';
+  state.selectedId = id; state.screen = isFechado ? 'nota' : 'detalhe';
   render();
   showToast('Serviço atualizado');
   addLog('Serviço editado — ' + f.client.trim(), changes);
 }
 function openDetalhe(id) { state.selectedId = id; state.screen = 'detalhe'; render(); }
 function openFechar(id) {
+  const svc = state.services.find((x) => x.id === id); if (!svc) return;
   state.selectedId = id; state.screen = 'fechar';
-  state.closeForm = { horimetroFinal: '', diarias: '' };
+  state.closeForm = { horimetroFinal: '', diarias: '', desconto: '', nf: !!svc.nf };
   state.closePhotoFim = null;
   render();
 }
@@ -633,6 +684,10 @@ function closeService() {
       showToast(svc.maquina === 'caminhao' ? 'Km final não pode ser menor que o inicial' : 'Horímetro final não pode ser menor que o inicial');
       return;
     }
+    if (!svc.fotoInicial || !(state.closePhotoFim || svc.fotoFinal)) {
+      showToast(svc.maquina === 'caminhao' ? 'Foto do odômetro inicial e final são obrigatórias' : 'Foto do horímetro inicial e final são obrigatórias');
+      return;
+    }
     patch.horFinal = hf;
   } else if (svc.tipo === 'diaria') {
     const d = num(state.closeForm.diarias);
@@ -640,12 +695,16 @@ function closeService() {
     patch.diarias = d;
   }
   patch.fotoFinal = state.closePhotoFim || svc.fotoFinal || null;
+  patch.nf = !!state.closeForm.nf;
+  patch.nfPercent = patch.nf ? state.config.nfPercent : null;
+  const desc = num(state.closeForm.desconto);
+  patch.desconto = isNaN(desc) ? 0 : desc;
   patch.notaNumero = svc.notaNumero || nextNotaNumero();
   const idx = state.services.findIndex((x) => x.id === svc.id);
   const updated = { ...svc, ...patch };
 
-  const before = { status: svc.status, horFinal: svc.horFinal, diarias: svc.diarias };
-  const after = { status: updated.status, horFinal: updated.horFinal, diarias: updated.diarias };
+  const before = { status: svc.status, horFinal: svc.horFinal, diarias: svc.diarias, nf: svc.nf, desconto: svc.desconto };
+  const after = { status: updated.status, horFinal: updated.horFinal, diarias: updated.diarias, nf: updated.nf, desconto: updated.desconto };
   const changes = diffSummary(before, after, SERVICE_FIELD_LABELS);
   changes.push(`Total: ${fmtBRL(totalOf(updated))}`);
 
@@ -673,13 +732,55 @@ function togglePago(id) {
 function goBack() {
   const s = state.screen;
   if (s === 'fechar') state.screen = 'detalhe';
-  else if (s === 'editar') state.screen = 'detalhe';
+  else if (s === 'editar') {
+    const svc = state.services.find((x) => x.id === state.editingId);
+    state.screen = (svc && svc.status === 'fechado') ? 'nota' : 'detalhe';
+  }
   else if (s === 'config-lock') state.screen = 'home';
-  else if (s === 'config') state.screen = 'home';
+  else if (s === 'config') { state.screen = 'home'; state._configBefore = null; }
   else if (s === 'logs') state.screen = 'config';
+  else if (s === 'falhas') state.screen = 'config';
   else if (s === 'export-instructions') state.screen = 'home';
   else if (s === 'nota') { state.screen = 'home'; state.tab = 'finalizados'; }
   else state.screen = 'home';
+  render();
+}
+
+/* ---------------------------------------------------------------------- *
+ * Falhas de horímetro/km — detecta "buracos" entre notas fechadas da
+ * mesma máquina (retroescavadeira e caminhão são tratados como um único
+ * equipamento cada, comparando em ordem numérica de horímetro/km).
+ * ---------------------------------------------------------------------- */
+function computeGaps(maquina) {
+  const list = state.services
+    .filter((s) => (s.maquina || 'retro') === maquina && s.tipo === 'hora' && s.status === 'fechado' && s.horInicial != null && s.horFinal != null)
+    .slice()
+    .sort((a, b) => a.horInicial - b.horInicial);
+  const gaps = [];
+  for (let i = 1; i < list.length; i++) {
+    const prev = list[i - 1], curr = list[i];
+    if (curr.horInicial > prev.horFinal + 0.01) {
+      gaps.push({ maquina, deHor: prev.horFinal, ateHor: curr.horInicial, prevClient: prev.client, currClient: curr.client });
+    }
+  }
+  return gaps;
+}
+function gapKey(g) { return g.maquina + '|' + g.deHor + '|' + g.ateHor; }
+function findJustification(g) {
+  return (state.gapJustifications || []).find((j) => j.maquina === g.maquina && Math.abs(j.deHor - g.deHor) < 0.001 && Math.abs(j.ateHor - g.ateHor) < 0.001);
+}
+function saveGapJustification(maquina, deHor, ateHor, texto) {
+  const entry = {
+    id: 'gap-' + Date.now() + '-' + Math.random().toString(36).slice(2),
+    maquina, deHor, ateHor, texto,
+    createdAt: new Date().toISOString(), userName: state.userName || 'Usuário sem nome'
+  };
+  state.gapJustifications = state.gapJustifications || [];
+  state.gapJustifications.push(entry);
+  saveMeta('gapJustifications', state.gapJustifications);
+  queueSync('gap_justification', entry);
+  showToast('Justificativa salva');
+  addLog('Justificativa de falha de horímetro/km — ' + (maquina === 'caminhao' ? 'Caminhão' : 'Retroescavadeira') + ' — ' + texto);
   render();
 }
 
@@ -689,7 +790,7 @@ function goBack() {
 const TITLES = {
   novo: 'Novo serviço', editar: 'Editar serviço', detalhe: 'Serviço em andamento', fechar: 'Fechar serviço',
   nota: 'Nota de serviço', config: 'Configurações', 'config-lock': 'Acesso restrito',
-  logs: 'Logs de operações', 'export-instructions': 'Exportar dados'
+  logs: 'Logs de operações', 'export-instructions': 'Exportar dados', falhas: 'Falhas de horímetro/km'
 };
 
 function headerHtml() {
@@ -700,7 +801,6 @@ function headerHtml() {
       <div class="spacer"></div>
       <button class="icon-btn" data-action="export-data" title="Exportar dados">${ICON.export}</button>
       <button class="icon-btn" data-action="open-config" title="Configurações">${ICON.gear}</button>
-      <div class="avatar">${ICON.avatar}</div>
     </div>`;
   }
   const title = TITLES[state.screen] || '';
@@ -819,13 +919,27 @@ function photoSlotHtml(id, dataUrl, label, targetAction) {
 function formScreen() {
   const f = state.form;
   const isEdit = state.screen === 'editar';
+  const editingSvc = isEdit ? state.services.find((x) => x.id === state.editingId) : null;
+  const isFechadoEdit = !!(editingSvc && editingSvc.status === 'fechado');
   const cfg = state.config;
-  const valid = f.client.trim() && !isNaN(num(f.valor));
+  function closingFieldsValid() {
+    if (!isFechadoEdit) return true;
+    if (f.tipo === 'hora') {
+      const hi = num(f.horimetro), hf = num(f.horimetroFinal);
+      return !isNaN(hi) && !isNaN(hf) && hf >= hi && !!state.formPhotoIni && !!state.formPhotoFim;
+    }
+    if (f.tipo === 'diaria') return !isNaN(num(f.diarias));
+    return true;
+  }
+  const valid = f.client.trim() && !isNaN(num(f.valor)) && closingFieldsValid();
   const valorLabel = f.tipo === 'hora' ? (f.maquina === 'caminhao' ? 'Valor do km (R$)' : 'Valor da hora (R$)') : (f.tipo === 'diaria' ? 'Valor da diária (R$)' : 'Valor combinado (R$)');
   const tipoSectionLabel = f.maquina === 'caminhao' ? 'Tipo de frete' : 'Tipo de serviço';
   const tipoHoraLabel = f.maquina === 'caminhao' ? 'Por km' : 'Por hora';
   const formHorimetroLabel = f.maquina === 'caminhao' ? 'Km inicial' : 'Horímetro inicial';
   const formFotoLabel = f.maquina === 'caminhao' ? 'Foto do odômetro' : 'Foto do horímetro';
+  const closeHorFinalLabel = f.maquina === 'caminhao' ? 'Km final' : 'Horímetro final';
+  const closeFotoFimLabel = f.maquina === 'caminhao' ? 'Foto do odômetro final' : 'Foto do horímetro final';
+  const closeFotoLabelShort = f.maquina === 'caminhao' ? 'Foto do odômetro' : 'Foto do horímetro';
   const nfMessage = (cfg.nfMessage || '').split('{percentual}').join(String(cfg.nfPercent));
 
   return `<div class="screen" style="padding-top:16px;padding-bottom:8px;">
@@ -880,6 +994,25 @@ function formScreen() {
       <label>${esc(formFotoLabel)}</label>
       ${photoSlotHtml('form-photo', state.formPhotoIni, 'Toque para a foto', 'photo-form')}
     </div>` : ''}
+    ${isFechadoEdit && f.tipo === 'hora' ? `
+    <div class="field">
+      <label>${esc(closeHorFinalLabel)}</label>
+      <input class="mono" data-field="form.horimetroFinal" value="${esc(f.horimetroFinal)}" inputmode="decimal" placeholder="Ex: 1272,5">
+    </div>
+    <div class="field">
+      <label>${esc(closeFotoFimLabel)}</label>
+      ${photoSlotHtml('form-photo-fim', state.formPhotoFim, closeFotoLabelShort, 'photo-form-fim')}
+    </div>` : ''}
+    ${isFechadoEdit && f.tipo === 'diaria' ? `
+    <div class="field">
+      <label>Quantidade de diárias</label>
+      <input class="mono" data-field="form.diarias" value="${esc(f.diarias)}" inputmode="decimal" placeholder="Ex: 3">
+    </div>` : ''}
+    ${isFechadoEdit ? `
+    <div class="field">
+      <label>Desconto (R$)</label>
+      <input class="mono" data-field="form.desconto" value="${esc(f.desconto)}" inputmode="decimal" placeholder="Ex: 20,00">
+    </div>` : ''}
     <div class="field">
       <label>Local do serviço</label>
       <input data-field="form.local" value="${esc(f.local)}" placeholder="Ex: Estrada do Café, km 7 — Patrocínio/MG">
@@ -910,6 +1043,7 @@ function detalheScreen() {
         <div class="cell"><div class="k">${isFechado ? 'Fechado' : 'Iniciado'}</div><div class="v">${esc(isFechado ? v.closedAt : v.startedAt)}</div></div>
         ${isFechado && v.isHora ? `<div class="cell"><div class="k">${esc(v.horFinalLabel)}</div><div class="v mono">${esc(v.horFim)}</div></div>` : ''}
         ${isFechado && v.isDiaria ? `<div class="cell"><div class="k">Diárias</div><div class="v mono">${esc(v.diarias)}</div></div>` : ''}
+        ${isFechado && v.desconto > 0 ? `<div class="cell"><div class="k">Desconto</div><div class="v mono">-${esc(v.descontoFmt)}</div></div>` : ''}
         ${isFechado ? `<div class="cell"><div class="k">Total</div><div class="v mono" style="color:var(--money);">${esc(v.totalFmt)}</div></div>` : ''}
       </div>
       ${v.isHora ? `<div style="margin-top:16px;display:flex;gap:10px;">
@@ -934,15 +1068,20 @@ function fecharScreen() {
   const s = state.services.find((x) => x.id === state.selectedId); if (!s) return '';
   const v = vm(s);
   const cf = state.closeForm;
-  let closeHoras = '—', closeTotal = fmtBRL(0), closeNfExtra = fmtBRL(0), closeHasNf = false, base = 0;
+  let closeHoras = '—', base = 0;
   if (s.tipo === 'hora') {
     const hf = num(cf.horimetroFinal); const h = !isNaN(hf) ? Math.max(0, hf - s.horInicial) : 0;
     closeHoras = fmtQty(h, s.maquina); base = h * s.valor;
   } else if (s.tipo === 'diaria') {
     const d = num(cf.diarias) || 0; closeHoras = d + ' diária(s)'; base = d * s.valor;
   } else { closeHoras = 'Valor fechado'; base = s.valor; }
-  if (s.nf && s.nfPercent) { closeHasNf = true; const extra = base * (s.nfPercent / 100); closeNfExtra = fmtBRL(extra); closeTotal = fmtBRL(base + extra); }
-  else closeTotal = fmtBRL(base);
+
+  const nfPercent = state.config.nfPercent;
+  const closeHasNf = !!cf.nf;
+  const nfExtra = closeHasNf ? base * (nfPercent / 100) : 0;
+  const desconto = num(cf.desconto) || 0;
+  const closeTotal = Math.max(0, base + nfExtra - desconto);
+  const nfMessage = (state.config.nfMessage || '').split('{percentual}').join(String(nfPercent));
 
   return `<div class="screen">
     <div class="card" style="margin-bottom:16px;">
@@ -964,12 +1103,22 @@ function fecharScreen() {
       <input class="mono" data-field="closeForm.diarias" value="${esc(cf.diarias)}" inputmode="decimal" placeholder="Ex: 3">
     </div>` : ''}
     ${v.isFechado ? `<div class="card" style="background:var(--surfaceAlt);margin-bottom:16px;">Serviço por valor fechado. Confirme abaixo para gerar a nota.</div>` : ''}
+    <button class="checkbox-row ${cf.nf ? 'checked' : ''}" data-action="toggle-fechar-nf">
+      <span class="box">${cf.nf ? ICON.check : ''}</span>
+      <span class="lbl">Precisa de Nota Fiscal?</span>
+    </button>
+    ${cf.nf ? `<div class="warning-box">${ICON.warn}<span>${esc(nfMessage)}</span></div>` : ''}
+    <div class="field">
+      <label>Desconto (R$)</label>
+      <input class="mono" data-field="closeForm.desconto" value="${esc(cf.desconto)}" inputmode="decimal" placeholder="Ex: 20,00">
+    </div>
     <div class="summary-box">
       <div class="summary-row"><span>Total apurado</span><span class="v mono">${esc(closeHoras)}</span></div>
       <div class="summary-row"><span>${esc(v.metricLabel)}</span><span class="v mono">${esc(v.metricFmt)}</span></div>
-      ${closeHasNf ? `<div class="summary-row"><span>Acréscimo NF (${esc(v.nfPercentFmt)})</span><span class="v mono">+${esc(closeNfExtra)}</span></div>` : ''}
+      ${closeHasNf ? `<div class="summary-row"><span>Acréscimo NF (${nfPercent}%)</span><span class="v mono">+${esc(fmtBRL(nfExtra))}</span></div>` : ''}
+      ${desconto > 0 ? `<div class="summary-row"><span>Desconto</span><span class="v mono">-${esc(fmtBRL(desconto))}</span></div>` : ''}
       <div class="summary-div"></div>
-      <div class="summary-total"><span class="k">Valor total</span><span class="v mono">${esc(closeTotal)}</span></div>
+      <div class="summary-total"><span class="k">Valor total</span><span class="v mono">${esc(fmtBRL(closeTotal))}</span></div>
     </div>
     <button class="btn btn-primary" style="margin-top:18px;" data-action="close-service">Fechar e gerar nota</button>
   </div>`;
@@ -991,7 +1140,7 @@ function notaCardHtml(v, forPrint) {
       <div><div class="nota-k">Cliente</div><div class="nota-v">${esc(v.client)}</div></div>
       <div style="text-align:right;"><div class="nota-k">Data</div><div class="nota-v">${esc(hoje)}</div></div>
     </div>
-    <div class="nota-local"><span class="nota-k">Local</span><div style="margin-top:3px;">${esc(v.local)}</div></div>
+    ${v.raw.local ? `<div class="nota-local"><span class="nota-k">Local</span><div style="margin-top:3px;">${esc(v.raw.local)}</div></div>` : ''}
     <div class="nota-table">
       <div class="nota-tr"><span class="l">Tipo de serviço</span><span class="r">${esc(v.tipoLabel)}</span></div>
       ${v.isHora ? `
@@ -1000,6 +1149,7 @@ function notaCardHtml(v, forPrint) {
       <div class="nota-tr"><span class="l">${esc(v.totalUnitLabel)}</span><span class="r mono">${esc(fmtQty(Math.max(0, (v.raw.horFinal||0) - (v.raw.horInicial||0)), v.raw.maquina))}</span></div>` : ''}
       <div class="nota-tr"><span class="l">${esc(v.metricLabel)}</span><span class="r mono">${esc(v.metricFmt)}</span></div>
       ${v.nf ? `<div class="nota-tr"><span class="l">Acréscimo NF (${esc(v.nfPercentFmt)})</span><span class="r mono">+${esc(v.nfExtraFmt)}</span></div>` : ''}
+      ${v.desconto > 0 ? `<div class="nota-tr"><span class="l">Desconto</span><span class="r mono">-${esc(v.descontoFmt)}</span></div>` : ''}
     </div>
     ${v.isHora ? `
     <div class="nota-fotos">
@@ -1007,7 +1157,6 @@ function notaCardHtml(v, forPrint) {
       <div class="col"><div class="lbl">${esc(v.fotoFimLabel)}</div><div class="photo-small">${v.fotoFinal ? `<img src="${v.fotoFinal}">` : ''}</div></div>
     </div>` : ''}
     <div class="nota-total"><span class="k">TOTAL A PAGAR</span><span class="v">${esc(v.totalFmt)}</span></div>
-    <div class="nota-sig">Assinatura do cliente</div>
   </div>`;
 }
 
@@ -1017,9 +1166,10 @@ function notaScreen() {
   return `<div class="screen">
     ${notaCardHtml(v, false)}
     <div class="btn-row">
+      <button class="btn btn-outline-solid" style="display:flex;align-items:center;justify-content:center;gap:8px;" data-action="editar" data-id="${s.id}">${ICON.edit}Editar</button>
       <button class="btn btn-outline-solid" data-action="pdf" data-id="${s.id}">Baixar PDF</button>
-      <button class="btn btn-whats wide" data-action="send-whats" data-id="${s.id}">${ICON.whats}Enviar no WhatsApp</button>
     </div>
+    <button class="btn btn-whats" style="margin-top:10px;" data-action="send-whats" data-id="${s.id}">${ICON.whats}Enviar no WhatsApp</button>
   </div>`;
 }
 
@@ -1038,6 +1188,9 @@ function configLockScreen() {
 
 function configScreen() {
   const cfg = state.config;
+  if (!state._configBefore) {
+    state._configBefore = { nfPercent: cfg.nfPercent, valorHoraSugerido: cfg.valorHoraSugerido, payMethods: { ...cfg.payMethods } };
+  }
   if (typeof state._apiUrlDraft !== 'string') state._apiUrlDraft = state.apiUrl || '';
   if (typeof state._pinApiUrlDraft !== 'string') state._pinApiUrlDraft = state.pinApiUrl || '';
   if (typeof state._valorHoraDraft !== 'string') state._valorHoraDraft = cfg.valorHoraSugerido != null ? fmtDecimalInput(cfg.valorHoraSugerido) : '';
@@ -1082,6 +1235,43 @@ function configScreen() {
 
     <button class="btn btn-primary" data-action="save-config">Salvar configurações</button>
     <button class="btn btn-outline-solid" style="margin-top:10px;display:flex;align-items:center;justify-content:center;gap:8px;" data-action="open-logs">${ICON.list}Ver logs de operações</button>
+    <button class="btn btn-outline-solid" style="margin-top:10px;display:flex;align-items:center;justify-content:center;gap:8px;" data-action="open-falhas">${ICON.warn}Ver falhas de horímetro/km</button>
+  </div>`;
+}
+
+function falhasScreen() {
+  const retroGaps = computeGaps('retro');
+  const caminhaoGaps = computeGaps('caminhao');
+  function section(title, gaps, unit) {
+    let body;
+    if (!gaps.length) {
+      body = `<div class="empty-state" style="padding:20px;"><div class="s">Nenhuma falha encontrada.</div></div>`;
+    } else {
+      body = gaps.map((g) => {
+        const just = findJustification(g);
+        const key = gapKey(g);
+        const draft = (state._gapDrafts && state._gapDrafts[key]) || '';
+        return `<div class="card" style="margin-bottom:12px;">
+          <div style="font-weight:700;font-size:14px;">Buraco de ${esc(fmtHor(g.ateHor - g.deHor))}${unit}</div>
+          <div style="font-size:12.5px;color:var(--inkSoft);margin-top:2px;">De ${esc(fmtHor(g.deHor))}${unit} (após ${esc(g.prevClient)}) até ${esc(fmtHor(g.ateHor))}${unit} (antes de ${esc(g.currClient)})</div>
+          ${just
+            ? `<div class="warning-box" style="margin-top:10px;background:var(--chipBg);">${ICON.checkBig}<span><b>Justificado:</b> ${esc(just.texto)}</span></div>`
+            : `<div style="margin-top:10px;">
+                <input data-field="_gapDraft:${key}" value="${esc(draft)}" placeholder="Ex: Deslocamento, levado ao mecânico..." style="width:100%;height:44px;background:var(--fieldBg);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:0 12px;font-size:13.5px;margin-bottom:8px;">
+                <div style="display:flex;gap:8px;">
+                  <button class="btn-sm btn-outline-solid" data-action="gap-justify" data-key="${key}" data-maquina="${g.maquina}" data-de="${g.deHor}" data-ate="${g.ateHor}">Salvar justificativa</button>
+                  <button class="btn-sm btn-whats" data-action="gap-open-novo" data-maquina="${g.maquina}" data-de="${g.deHor}">Abrir nota de serviço</button>
+                </div>
+              </div>`}
+        </div>`;
+      }).join('');
+    }
+    return `<div style="font-weight:800;font-size:15px;margin:18px 0 10px;">${esc(title)}</div>${body}`;
+  }
+  return `<div class="screen">
+    <div style="font-size:13px;color:var(--inkSoft);line-height:1.5;margin-bottom:6px;">Compara o horímetro/km final de cada serviço fechado com o inicial do próximo, na ordem numérica, e aponta os intervalos sem nota registrada.</div>
+    ${section('Retroescavadeira', retroGaps, ' h')}
+    ${section('Caminhão', caminhaoGaps, ' km')}
   </div>`;
 }
 
@@ -1150,9 +1340,15 @@ function screenHtml() {
     case 'config-lock': return configLockScreen();
     case 'config': return configScreen();
     case 'logs': return logsScreen();
+    case 'falhas': return falhasScreen();
     case 'export-instructions': return exportInstructionsScreen();
     default: return homeScreen();
   }
+}
+
+function footerHtml() {
+  if (state.screen === 'user-setup') return '';
+  return `<div class="app-footer">${esc(COMPANY.name)} · ${esc(APP_VERSION)}</div>`;
 }
 
 let _lastFocus = null;
@@ -1163,7 +1359,7 @@ function render() {
   const activeField = active && active.getAttribute ? active.getAttribute('data-field') : null;
   const selStart = active && 'selectionStart' in active ? active.selectionStart : null;
 
-  app.innerHTML = headerHtml() + screenHtml() + (state.toast ? `<div class="toast-wrap"><div class="toast">${ICON.toastCheck}${esc(state.toast)}</div></div>` : '');
+  app.innerHTML = headerHtml() + screenHtml() + footerHtml() + (state.toast ? `<div class="toast-wrap"><div class="toast">${ICON.toastCheck}${esc(state.toast)}</div></div>` : '');
 
   if (activeField) {
     const el = app.querySelector(`[data-field="${activeField}"]`);
@@ -1188,19 +1384,40 @@ function bindEvents() {
   app.addEventListener('input', (e) => {
     const field = e.target.getAttribute('data-field');
     if (!field) return;
+    if (field.indexOf('_gapDraft:') === 0) {
+      const key = field.slice('_gapDraft:'.length);
+      if (!state._gapDrafts) state._gapDrafts = {};
+      state._gapDrafts[key] = e.target.value;
+      return;
+    }
     if (field === 'form.contact') {
       const masked = maskPhone(e.target.value);
       state.form.contact = masked;
       if (e.target.value !== masked) { e.target.value = masked; }
       return;
     }
-    setByPath(state, field, e.target.value);
-    if (field === 'form.client' || field === 'form.valor') {
+    if (field === 'form.client') {
+      const upper = e.target.value.toUpperCase();
+      state.form.client = upper;
+      if (e.target.value !== upper) { e.target.value = upper; }
       const btn = app.querySelector('[data-action="form-submit"]');
       if (btn) {
         const valid = state.form.client.trim() && !isNaN(num(state.form.valor));
         btn.className = 'btn ' + (valid ? 'btn-primary' : 'btn-disabled');
       }
+      return;
+    }
+    setByPath(state, field, e.target.value);
+    if (field === 'form.valor') {
+      const btn = app.querySelector('[data-action="form-submit"]');
+      if (btn) {
+        const valid = state.form.client.trim() && !isNaN(num(state.form.valor));
+        btn.className = 'btn ' + (valid ? 'btn-primary' : 'btn-disabled');
+      }
+    }
+    if (field === 'closeForm.horimetroFinal' || field === 'closeForm.diarias' || field === 'closeForm.desconto'
+        || field === 'form.horimetroFinal' || field === 'form.diarias' || field === 'form.desconto') {
+      render();
     }
   });
 
@@ -1260,11 +1477,35 @@ function bindEvents() {
       }
       case 'save-config': saveConfig(); render(); break;
       case 'open-logs': state.screen = 'logs'; render(); break;
+      case 'open-falhas': state.screen = 'falhas'; render(); break;
+      case 'toggle-fechar-nf': state.closeForm.nf = !state.closeForm.nf; render(); break;
+      case 'gap-justify': {
+        const key = target.getAttribute('data-key');
+        const maquina = target.getAttribute('data-maquina');
+        const de = Number(target.getAttribute('data-de'));
+        const ate = Number(target.getAttribute('data-ate'));
+        const texto = ((state._gapDrafts && state._gapDrafts[key]) || '').trim();
+        if (!texto) { showToast('Escreva uma justificativa'); break; }
+        saveGapJustification(maquina, de, ate, texto);
+        break;
+      }
+      case 'gap-open-novo': {
+        const maquina = target.getAttribute('data-maquina');
+        const de = Number(target.getAttribute('data-de'));
+        openNovo();
+        state.form.maquina = maquina;
+        state.form.tipo = 'hora';
+        state.form.horimetro = String(de).replace('.', ',');
+        render();
+        break;
+      }
       case 'rename-user': state.userNameInput = state.userName || ''; state.userSetupReturnScreen = 'config'; state.screen = 'user-setup'; render(); break;
       case 'photo-form': openPhotoPicker('form'); break;
       case 'photo-close': openPhotoPicker('close'); break;
+      case 'photo-form-fim': openPhotoPicker('form-fim'); break;
       case 'photo-form-remove': e.stopPropagation(); state.formPhotoIni = null; render(); break;
       case 'photo-close-remove': e.stopPropagation(); state.closePhotoFim = null; render(); break;
+      case 'photo-form-fim-remove': e.stopPropagation(); state.formPhotoFim = null; render(); break;
     }
   });
 
@@ -1275,10 +1516,10 @@ function bindEvents() {
  * Inicialização
  * ---------------------------------------------------------------------- */
 async function loadState() {
-  const [deviceId, userName, config, pinApiUrl, apiUrl, seq, notaCounters, services, logs, syncQueue] = await Promise.all([
+  const [deviceId, userName, config, pinApiUrl, apiUrl, seq, notaCounters, services, logs, syncQueue, gapJustifications] = await Promise.all([
     dbGet('meta', 'deviceId'), dbGet('meta', 'userName'), dbGet('meta', 'config'), dbGet('meta', 'pinApiUrl'),
     dbGet('meta', 'apiUrl'), dbGet('meta', 'seq'), dbGet('meta', 'notaCounters'),
-    dbGetAll('services'), dbGetAll('logs'), dbGetAll('syncQueue')
+    dbGetAll('services'), dbGetAll('logs'), dbGetAll('syncQueue'), dbGet('meta', 'gapJustifications')
   ]);
 
   if (deviceId && deviceId.value) state.deviceId = deviceId.value;
@@ -1296,6 +1537,7 @@ async function loadState() {
   state.services = services || [];
   state.logs = (logs || []).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   state.syncQueue = syncQueue || [];
+  if (gapJustifications && gapJustifications.value) state.gapJustifications = gapJustifications.value;
 }
 
 function registerSW() {
