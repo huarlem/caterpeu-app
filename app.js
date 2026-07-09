@@ -16,7 +16,7 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.2.0';
+const APP_VERSION = 'v1.3.0';
 
 /* ---------------------------------------------------------------------- *
  * Ícones (SVG inline, fiéis ao design)
@@ -437,19 +437,160 @@ async function exportData() {
 }
 
 /* ---------------------------------------------------------------------- *
- * PDF (impressão nativa do navegador — "Salvar como PDF")
+ * PDF — gerado localmente com jsPDF (lib/jspdf.umd.min.js, offline, sem CDN).
+ * Não depende de window.print(): isso é importante porque a caixa de diálogo
+ * de impressão do navegador não abre quando o app está instalado (PWA em
+ * modo standalone), então window.print() simplesmente não funciona no celular
+ * uma vez instalado — só funcionava dentro de uma aba normal do Chrome.
  * ---------------------------------------------------------------------- */
-function downloadPdf(sel) {
-  const area = document.getElementById('print-area');
-  area.innerHTML = notaCardHtml(sel, true);
-  showToast('Abrindo impressão — escolha "Salvar como PDF"');
-  addLog('PDF da nota gerado — ' + sel.client);
-  setTimeout(() => window.print(), 200);
+function buildNotaPdfDoc(v) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const marginX = 18;
+  let y = 20;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(16);
+  doc.text(COMPANY.name, marginX, y);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(12);
+  doc.text('Nota Nº ' + v.notaNumero, pageWidth - marginX, y - 2, { align: 'right' });
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.text('Data: ' + new Date().toLocaleDateString('pt-BR'), pageWidth - marginX, y + 4, { align: 'right' });
+
+  y += 6;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9.5);
+  doc.setTextColor(110, 106, 96);
+  doc.text('CNPJ ' + COMPANY.cnpj, marginX, y); y += 4.5;
+  doc.text(COMPANY.region, marginX, y); y += 4.5;
+  doc.text(COMPANY.phones, marginX, y);
+  doc.setTextColor(23, 21, 15);
+
+  y += 8;
+  doc.setDrawColor(220);
+  doc.line(marginX, y, pageWidth - marginX, y);
+  y += 9;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(12.5);
+  doc.text('Cliente: ' + v.client, marginX, y);
+  y += 7;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  if (v.raw.local) { doc.text('Local: ' + v.raw.local, marginX, y); y += 7; }
+
+  const rows = [['Tipo de serviço', v.tipoLabel]];
+  if (v.isHora) {
+    rows.push([v.horInicialLabel, v.horIni]);
+    rows.push([v.horFinalLabel, v.horFim]);
+    rows.push([v.totalUnitLabel, fmtQty(Math.max(0, (v.raw.horFinal || 0) - (v.raw.horInicial || 0)), v.raw.maquina)]);
+  }
+  if (v.isDiaria) rows.push(['Diárias', String(v.diarias != null ? v.diarias : '—')]);
+  rows.push([v.metricLabel, v.metricFmt]);
+  if (v.nf) rows.push(['Acréscimo NF (' + v.nfPercentFmt + ')', '+' + v.nfExtraFmt]);
+  if (v.desconto > 0) rows.push(['Desconto', '-' + v.descontoFmt]);
+
+  y += 3;
+  doc.setFillColor(250, 248, 244);
+  doc.roundedRect(marginX, y, pageWidth - marginX * 2, rows.length * 6.5 + 4, 2, 2, 'F');
+  y += 8;
+  doc.setFontSize(10);
+  rows.forEach(([label, value]) => {
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(110, 106, 96);
+    doc.text(String(label), marginX + 4, y);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(23, 21, 15);
+    doc.text(String(value), pageWidth - marginX - 4, y, { align: 'right' });
+    y += 6.5;
+  });
+
+  y += 6;
+  doc.setDrawColor(23, 21, 15);
+  doc.setLineWidth(0.6);
+  doc.line(marginX, y, pageWidth - marginX, y);
+  doc.setLineWidth(0.2);
+  y += 9;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13.5);
+  doc.text('TOTAL A PAGAR', marginX, y);
+  doc.text(v.totalFmt, pageWidth - marginX, y, { align: 'right' });
+  y += 12;
+
+  if (v.isHora && (v.fotoInicial || v.fotoFinal)) {
+    const imgW = (pageWidth - marginX * 2 - 6) / 2;
+    const imgH = imgW * 0.7;
+    if (y + imgH + 10 > pageHeight - 14) { doc.addPage(); y = 20; }
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9);
+    doc.setTextColor(23, 21, 15);
+    if (v.fotoInicial) {
+      doc.text(v.fotoIniLabel, marginX, y);
+      try { doc.addImage(v.fotoInicial, 'JPEG', marginX, y + 2, imgW, imgH); } catch (e) {}
+    }
+    if (v.fotoFinal) {
+      doc.text(v.fotoFimLabel, marginX + imgW + 6, y);
+      try { doc.addImage(v.fotoFinal, 'JPEG', marginX + imgW + 6, y + 2, imgW, imgH); } catch (e) {}
+    }
+    y += imgH + 10;
+  }
+
+  return doc;
 }
-window.addEventListener('afterprint', () => {
-  const area = document.getElementById('print-area');
-  if (area) area.innerHTML = '';
-});
+
+async function downloadPdf(sel) {
+  if (!window.jspdf || !window.jspdf.jsPDF) {
+    showToast('Biblioteca de PDF não carregou — verifique se o app foi atualizado');
+    return;
+  }
+  let doc;
+  try {
+    doc = buildNotaPdfDoc(sel);
+  } catch (e) {
+    showToast('Não foi possível gerar o PDF');
+    return;
+  }
+  const filename = 'nota-' + sel.notaNumero + '.pdf';
+
+  let shared = false;
+  if (navigator.share && navigator.canShare) {
+    try {
+      const blob = doc.output('blob');
+      const file = new File([blob], filename, { type: 'application/pdf' });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Nota de serviço — ' + sel.client });
+        shared = true;
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') shared = true; // usuário cancelou deliberadamente
+    }
+  }
+
+  if (!shared) {
+    try {
+      doc.save(filename);
+      showToast('PDF baixado: ' + filename);
+    } catch (e) {
+      // último recurso: abre o PDF numa aba nova a partir de uma data URI.
+      try {
+        window.open(doc.output('bloburl'), '_blank');
+        showToast('PDF aberto numa nova aba');
+      } catch (e2) {
+        showToast('Não foi possível baixar o PDF');
+        return;
+      }
+    }
+  } else {
+    showToast('PDF compartilhado');
+  }
+  addLog('PDF da nota gerado — ' + sel.client);
+}
 
 /* ---------------------------------------------------------------------- *
  * ViewModel de serviço

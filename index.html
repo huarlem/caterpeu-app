@@ -25,6 +25,8 @@
 <!-- input de arquivo oculto reutilizado para captura de foto (câmera ou galeria) -->
 <input type="file" id="photo-input" accept="image/*" style="display:none">
 
+<!-- gera o PDF da nota localmente (sem depender de window.print(), que não funciona no PWA instalado) -->
+<script src="lib/jspdf.umd.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
