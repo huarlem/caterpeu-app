@@ -16,10 +16,10 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.6.1';
+const APP_VERSION = 'v1.7.0';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '09/07/2026 22:09';
+const BUILD_STAMP = '10/07/2026 02:20';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
@@ -294,11 +294,32 @@ function queueSync(type, payload) {
   const item = {
     id: 'sq-' + Date.now() + '-' + Math.random().toString(36).slice(2),
     type, payload, device_id: state.deviceId, user_name: state.userName,
-    created_at: new Date().toISOString(), synced: false
+    created_at: new Date().toISOString(), synced_at: null
   };
   state.syncQueue.push(item);
   dbPut('syncQueue', item);
   trySync();
+}
+
+/* Um evento tem: created_at (data de edição/criação, imutável) e synced_at
+ * (data de sincronização, null até ser enviado com sucesso). Ele só está
+ * pendente de envio quando nunca foi sincronizado, ou quando a data de
+ * edição é posterior à data de sincronização. Essa mesma regra vale tanto
+ * pro envio automático via API (trySync) quanto pra exportação manual
+ * (exportData) — os dois só mandam o que ainda não foi sincronizado. */
+function isPendingSync(item) {
+  if (!item.synced_at) return true;
+  return new Date(item.created_at).getTime() > new Date(item.synced_at).getTime();
+}
+
+/* Formato "limpo" do evento, sem os campos de controle local (synced_at):
+ * é exatamente isso que sai tanto no POST pra API quanto no JSON exportado
+ * manualmente, pra garantir que os dois formatos sejam idênticos. */
+function toOutboundEvent(item) {
+  return {
+    id: item.id, type: item.type, payload: item.payload,
+    device_id: item.device_id, user_name: item.user_name, created_at: item.created_at
+  };
 }
 
 let _syncing = false;
@@ -307,15 +328,15 @@ async function trySync() {
   if (!state.apiUrl || !navigator.onLine) { updateSyncBadge(); return; }
   _syncing = true;
   try {
-    const pending = state.syncQueue.filter((i) => !i.synced);
+    const pending = state.syncQueue.filter(isPendingSync);
     for (const item of pending) {
       try {
         const res = await fetch(state.apiUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(item)
+          body: JSON.stringify(toOutboundEvent(item))
         });
-        if (res.ok) { item.synced = true; await dbPut('syncQueue', item); }
+        if (res.ok) { item.synced_at = new Date().toISOString(); await dbPut('syncQueue', item); }
         else { break; }
       } catch (e) { break; }
     }
@@ -327,7 +348,7 @@ async function trySync() {
 function updateSyncBadge() {
   const badge = document.getElementById('sync-badge');
   if (badge) {
-    const pending = state.syncQueue.filter((i) => !i.synced).length;
+    const pending = state.syncQueue.filter(isPendingSync).length;
     badge.textContent = state.apiUrl
       ? (pending > 0 ? `${pending} pendente(s) de sincronização` : 'Tudo sincronizado')
       : 'Nenhuma API configurada — dados só ficam locais';
@@ -495,12 +516,19 @@ function openWhatsAppExport() {
  * evento {id, type, payload, device_id, user_name, created_at}. Assim os
  * dois jeitos de exportar ficam sempre idênticos, sem precisar manter dois
  * formatos diferentes em paralelo.
+ * Igual à sincronização automática, só entram no arquivo os eventos ainda
+ * PENDENTES (isPendingSync): nunca sincronizados, ou editados depois da
+ * última sincronização. Depois de exportar com sucesso, esses eventos são
+ * marcados como sincronizados (synced_at), pra não duplicar no próximo
+ * export nem no próximo envio pra API.
  * ---------------------------------------------------------------------- */
 async function exportData() {
-  const eventos = state.syncQueue.map((item) => ({
-    id: item.id, type: item.type, payload: item.payload,
-    device_id: item.device_id, user_name: item.user_name, created_at: item.created_at
-  }));
+  const pending = state.syncQueue.filter(isPendingSync);
+  if (!pending.length) {
+    showToast('Tudo já sincronizado — nada novo para exportar');
+    return;
+  }
+  const eventos = pending.map(toOutboundEvent);
   const data = { empresa: COMPANY.name, exportado_em: new Date().toISOString(), device_id: state.deviceId, eventos };
   const json = JSON.stringify(data, null, 2);
   const stamp = new Date().toISOString().slice(0, 10);
@@ -531,6 +559,11 @@ async function exportData() {
   } else {
     showToast('Dados exportados');
   }
+
+  const syncedNow = new Date().toISOString();
+  for (const item of pending) { item.synced_at = syncedNow; await dbPut('syncQueue', item); }
+  updateSyncBadge();
+
   addLog('Dados exportados — ' + filename);
   render();
 }
