@@ -16,7 +16,7 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.4.0';
+const APP_VERSION = 'v1.5.0';
 
 /* ---------------------------------------------------------------------- *
  * Ícones (SVG inline, fiéis ao design)
@@ -107,12 +107,24 @@ const SERVICE_FIELD_LABELS = {
   client: 'Cliente', contact: 'Telefone', tipo: 'Tipo', maquina: 'Máquina', valor: 'Valor',
   horInicial: 'Horímetro/km inicial', horFinal: 'Horímetro/km final', diarias: 'Diárias',
   local: 'Local', nf: 'Nota Fiscal', pagamento: 'Pagamento', status: 'Status', pago: 'Pago',
-  desconto: 'Desconto'
+  desconto: 'Desconto', descricao: 'Descrição do serviço',
+  paidAt: 'Data do pagamento', paidMethod: 'Forma de pagamento (recebimento)'
 };
+function imgFormatFromDataUrl(dataUrl) {
+  if (/^data:image\/png/i.test(dataUrl)) return 'PNG';
+  if (/^data:image\/webp/i.test(dataUrl)) return 'WEBP';
+  return 'JPEG';
+}
 function fmtDateTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
   return d.toLocaleDateString('pt-BR') + ' · ' + d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+}
+function fmtDateOnly(dateStr) {
+  if (!dateStr) return '';
+  const parts = String(dateStr).slice(0, 10).split('-');
+  if (parts.length !== 3) return String(dateStr);
+  return parts[2] + '/' + parts[1] + '/' + parts[0];
 }
 function initials(client) {
   return (String(client || '').match(/[A-Za-zÀ-ÿ]+/g) || ['?']).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
@@ -178,6 +190,15 @@ async function dbGet(store, key) {
     req.onerror = () => reject(req.error);
   });
 }
+async function dbDelete(store, key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
 
 async function saveMeta(key, value) { await dbPut('meta', { key, value }); }
 
@@ -196,8 +217,10 @@ const state = {
     nfMessage: 'Avise o cliente que o valor aumentará {percentual}% para emissão de Nota Fiscal.',
     pagMessage: 'Avise o cliente que só trabalhamos à vista.',
     payMethods: { dinheiro: true, pix: true, cartao: true, cheque: true },
-    valorHoraSugerido: 250
+    valorHoraSugerido: 250,
+    pixKey: ''
   },
+  pixQrCode: null,
   pinApiUrl: '',
   apiUrl: '',
   seq: 0,
@@ -214,17 +237,19 @@ const state = {
   finFilter: 'todos',
   logFilterFrom: '', logFilterTo: '',
 
-  form: { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', horimetroFinal: '', diarias: '', desconto: '', local: '', nf: false, pagamento: '' },
+  form: { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', horimetroFinal: '', diarias: '', desconto: '', local: '', nf: false, pagamento: '', descricao: '' },
   formPhotoIni: null,
   formPhotoFim: null,
   closeForm: { horimetroFinal: '', diarias: '', desconto: '', nf: false },
   closePhotoFim: null,
 
-  pendingPhotoTarget: null // 'form' | 'close' | 'form-fim'
+  pagoForm: { data: '', metodo: '' }, _pagoReturnScreen: null,
+
+  pendingPhotoTarget: null // 'form' | 'close' | 'form-fim' | 'pix-qr'
 };
 
 function emptyForm() {
-  return { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', horimetroFinal: '', diarias: '', desconto: '', local: '', nf: false, pagamento: '' };
+  return { client: '', contact: '', tipo: 'hora', maquina: 'retro', valor: '', horimetro: '', horimetroFinal: '', diarias: '', desconto: '', local: '', nf: false, pagamento: '', descricao: '' };
 }
 
 /* ---------------------------------------------------------------------- *
@@ -354,6 +379,15 @@ function fileToCompressedDataURL(file) {
   });
 }
 
+function fileToDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 function openPhotoPicker(target, useCamera) {
   state.pendingPhotoTarget = target;
   const input = document.getElementById('photo-input');
@@ -369,6 +403,15 @@ async function handlePhotoInputChange(e) {
   e.target.value = '';
   if (!file) return;
   try {
+    if (state.pendingPhotoTarget === 'pix-qr') {
+      // QR code não passa pela compressão em JPEG: preserva o arquivo original
+      // (PNG geralmente) para não perder nitidez e comprometer a leitura do código.
+      const dataUrl = await fileToDataURL(file);
+      state.pixQrCode = dataUrl;
+      saveMeta('pixQrCode', dataUrl);
+      render();
+      return;
+    }
     const dataUrl = await fileToCompressedDataURL(file);
     if (state.pendingPhotoTarget === 'form') state.formPhotoIni = dataUrl;
     else if (state.pendingPhotoTarget === 'close') state.closePhotoFim = dataUrl;
@@ -380,17 +423,54 @@ async function handlePhotoInputChange(e) {
 }
 
 /* ---------------------------------------------------------------------- *
- * WhatsApp
+ * WhatsApp — envia o PDF da nota (não mais só um texto). Usa a Web Share API
+ * pra anexar o arquivo direto; se o navegador não suportar compartilhar
+ * arquivos, baixa o PDF e abre o WhatsApp com uma mensagem pedindo pra
+ * anexar manualmente (única alternativa possível nesse caso — o link
+ * wa.me não permite anexar arquivos, só texto).
  * ---------------------------------------------------------------------- */
-function sendWhats(s) {
+async function sendWhats(s) {
+  if (!window.jspdf || !window.jspdf.jsPDF) {
+    showToast('Biblioteca de PDF não carregou — verifique se o app foi atualizado');
+    return;
+  }
+  const v = vm(s);
+  let doc;
   try {
-    const n = digitsOnly(s.contact);
-    const msg = encodeURIComponent('Olá! Segue a nota de serviço da ' + COMPANY.name + '. Total: ' + fmtBRL(totalOf(s)));
-    if (n) window.open('https://wa.me/55' + n + '?text=' + msg, '_blank');
-    else showToast('Cliente sem telefone cadastrado');
-  } catch (e) {}
-  showToast('Nota enviada pelo WhatsApp');
-  addLog('Nota enviada pelo WhatsApp — ' + s.client);
+    doc = buildNotaPdfDoc(v);
+  } catch (e) {
+    showToast('Não foi possível gerar o PDF');
+    return;
+  }
+  const filename = 'nota-' + v.notaNumero + '.pdf';
+
+  if (navigator.share && navigator.canShare) {
+    try {
+      const blob = doc.output('blob');
+      const file = new File([blob], filename, { type: 'application/pdf' });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({
+          files: [file],
+          title: 'Nota de serviço — ' + s.client,
+          text: 'Olá! Segue a nota de serviço da ' + COMPANY.name + '. Total: ' + fmtBRL(totalOf(s))
+        });
+        showToast('PDF compartilhado');
+        addLog('Nota (PDF) enviada pelo WhatsApp — ' + s.client);
+        return;
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') return; // usuário cancelou deliberadamente
+      // qualquer outro erro cai no fallback abaixo
+    }
+  }
+
+  try { doc.save(filename); } catch (e) {}
+  const n = digitsOnly(s.contact);
+  const msg = encodeURIComponent('Olá! Segue a nota de serviço da ' + COMPANY.name + '. Total: ' + fmtBRL(totalOf(s)) + '. (Anexe o PDF "' + filename + '" que acabou de ser baixado no aparelho.)');
+  if (n) window.open('https://wa.me/55' + n + '?text=' + msg, '_blank');
+  else window.open('https://wa.me/?text=' + msg, '_blank');
+  showToast('PDF baixado — anexe no WhatsApp');
+  addLog('Nota (PDF) enviada pelo WhatsApp — ' + s.client);
 }
 function openWhatsAppExport() {
   const filename = state.lastExportFilename || 'dados.json';
@@ -485,6 +565,14 @@ function buildNotaPdfDoc(v) {
   doc.setFontSize(10);
   if (v.raw.local) { doc.text('Local: ' + v.raw.local, marginX, y); y += 7; }
 
+  doc.setFont('helvetica', 'italic');
+  doc.setFontSize(9.5);
+  doc.setTextColor(90, 86, 78);
+  const descLines = doc.splitTextToSize(v.descricao, pageWidth - marginX * 2);
+  doc.text(descLines, marginX, y);
+  y += descLines.length * 4.5 + 4;
+  doc.setTextColor(23, 21, 15);
+
   const rows = [['Tipo de serviço', v.tipoLabel]];
   if (v.isHora) {
     rows.push([v.horInicialLabel, v.horIni]);
@@ -522,6 +610,30 @@ function buildNotaPdfDoc(v) {
   doc.text('TOTAL A PAGAR', marginX, y);
   doc.text(v.totalFmt, pageWidth - marginX, y, { align: 'right' });
   y += 12;
+
+  if (state.config.pixKey || state.pixQrCode) {
+    const qrSize = 30;
+    const blockH = Math.max(state.pixQrCode ? qrSize : 0, 14) + 4;
+    if (y + blockH > pageHeight - 14) { doc.addPage(); y = 20; }
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10.5);
+    doc.setTextColor(23, 21, 15);
+    doc.text('Pagamento via Pix', marginX, y);
+    y += 6;
+    let pixTextY = y;
+    if (state.config.pixKey) {
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(10);
+      doc.text('Chave: ' + state.config.pixKey, marginX, pixTextY);
+      pixTextY += 6;
+    }
+    if (state.pixQrCode) {
+      try { doc.addImage(state.pixQrCode, imgFormatFromDataUrl(state.pixQrCode), marginX, y, qrSize, qrSize); } catch (e) {}
+      y += qrSize + 8;
+    } else {
+      y = pixTextY + 4;
+    }
+  }
 
   if (v.isHora && (v.fotoInicial || v.fotoFinal)) {
     const imgW = (pageWidth - marginX * 2 - 6) / 2;
@@ -619,6 +731,9 @@ function vm(s) {
     fotoInicial: s.fotoInicial || null, fotoFinal: s.fotoFinal || null,
     notaNumero: s.notaNumero || String(s.id).padStart(4, '0'),
     desconto: s.desconto || 0, descontoFmt: fmtBRL(s.desconto || 0),
+    descricao: (s.descricao && s.descricao.trim())
+      ? s.descricao.trim()
+      : (isCaminhao ? 'Frete caminhão caçamba' : 'Serviço de retroescavadeira'),
     raw: s
   };
 }
@@ -681,8 +796,8 @@ function saveConfig() {
   // nunca aqui — senão o "antes" já estaria igual ao "depois".
   const snap = state._configBefore;
   const beforeCfg = snap
-    ? { nfPercent: snap.nfPercent, valorHoraSugerido: snap.valorHoraSugerido, ...snap.payMethods }
-    : { nfPercent: state.config.nfPercent, valorHoraSugerido: state.config.valorHoraSugerido, ...state.config.payMethods };
+    ? { nfPercent: snap.nfPercent, valorHoraSugerido: snap.valorHoraSugerido, pixKey: snap.pixKey || '', ...snap.payMethods }
+    : { nfPercent: state.config.nfPercent, valorHoraSugerido: state.config.valorHoraSugerido, pixKey: state.config.pixKey || '', ...state.config.payMethods };
 
   const p = num(String(state.config.nfPercent));
   state.config.nfPercent = isNaN(p) ? 0 : p;
@@ -705,8 +820,8 @@ function saveConfig() {
     saveMeta('apiUrl', state.apiUrl);
   }
 
-  const afterCfg = { nfPercent: state.config.nfPercent, valorHoraSugerido: state.config.valorHoraSugerido, ...state.config.payMethods };
-  const changes = diffSummary(beforeCfg, afterCfg, { nfPercent: 'Acréscimo NF (%)', valorHoraSugerido: 'Valor/hora sugerido', dinheiro: 'Dinheiro', pix: 'Pix', cartao: 'Cartão', cheque: 'Cheque' });
+  const afterCfg = { nfPercent: state.config.nfPercent, valorHoraSugerido: state.config.valorHoraSugerido, pixKey: state.config.pixKey || '', ...state.config.payMethods };
+  const changes = diffSummary(beforeCfg, afterCfg, { nfPercent: 'Acréscimo NF (%)', valorHoraSugerido: 'Valor/hora sugerido', pixKey: 'Chave Pix', dinheiro: 'Dinheiro', pix: 'Pix', cartao: 'Cartão', cheque: 'Cheque' });
 
   saveMeta('config', state.config);
   state._configBefore = null;
@@ -721,7 +836,7 @@ function openNovo() {
   saveMeta('seq', state.seq);
   state.draftId = state.seq; state.editingId = null;
   state.form = emptyForm();
-  if (state.config.valorHoraSugerido != null) {
+  if (state.config.valorHoraSugerido != null && state.form.maquina !== 'caminhao') {
     state.form.valor = fmtDecimalInput(state.config.valorHoraSugerido);
   }
   state.formPhotoIni = null;
@@ -739,15 +854,62 @@ function openEditar(id) {
     horimetroFinal: svc.horFinal != null ? String(svc.horFinal).replace('.', ',') : '',
     diarias: svc.diarias != null ? String(svc.diarias).replace('.', ',') : '',
     desconto: svc.desconto ? String(svc.desconto).replace('.', ',') : '',
-    local: svc.local || '', nf: !!svc.nf, pagamento: svc.pagamento || ''
+    local: svc.local || '', nf: !!svc.nf, pagamento: svc.pagamento || '', descricao: svc.descricao || ''
   };
   state.formPhotoIni = svc.fotoInicial || null;
   state.formPhotoFim = svc.fotoFinal || null;
   render();
 }
+function openDraft(id) {
+  const d = state.services.find((x) => x.id === id && x.status === 'rascunho'); if (!d) return;
+  state.draftId = id; state.editingId = null; state.screen = 'novo';
+  state.form = {
+    client: d.client || '', contact: d.contact || '', tipo: d.tipo || 'hora', maquina: d.maquina || 'retro',
+    valor: d.valor != null ? String(d.valor).replace('.', ',') : '',
+    horimetro: d.horInicial != null ? String(d.horInicial).replace('.', ',') : '',
+    horimetroFinal: '', diarias: '', desconto: '',
+    local: d.local || '', nf: !!d.nf, pagamento: d.pagamento || '', descricao: ''
+  };
+  state.formPhotoIni = d.fotoInicial || null;
+  state.formPhotoFim = null;
+  render();
+}
+function saveDraftIfNeeded() {
+  const f = state.form;
+  const hasContent = f.client.trim() || f.contact.trim() || f.valor || f.horimetro || f.local.trim() || f.pagamento || state.formPhotoIni;
+  if (!hasContent) return;
+  const valor = num(f.valor);
+  const draft = {
+    id: state.draftId, status: 'rascunho',
+    client: f.client.trim(), contact: f.contact.trim(), tipo: f.tipo, maquina: f.maquina || 'retro',
+    valor: isNaN(valor) ? null : valor,
+    horInicial: (f.tipo === 'fechado' || !f.horimetro) ? null : num(f.horimetro),
+    horFinal: null, diarias: null, desconto: null,
+    local: f.local.trim(), nf: !!f.nf, pagamento: f.pagamento || '',
+    fotoInicial: state.formPhotoIni || null, fotoFinal: null, notaNumero: null,
+    startedAt: nowLabel(), startedAtISO: new Date().toISOString(), closedAt: null
+  };
+  const idx = state.services.findIndex((x) => x.id === draft.id);
+  if (idx === -1) state.services.unshift(draft); else state.services[idx] = draft;
+  persistService(draft);
+  showToast('Rascunho salvo');
+  addLog('Rascunho salvo — ' + (draft.client || '(sem nome)'));
+}
+function deleteDraft(id) {
+  const idx = state.services.findIndex((x) => x.id === id && x.status === 'rascunho'); if (idx === -1) return;
+  const d = state.services[idx];
+  state.services.splice(idx, 1);
+  dbDelete('services', id);
+  addLog('Rascunho excluído — ' + (d.client || '(sem nome)'));
+  showToast('Rascunho excluído');
+  render();
+}
 function startService() {
   const f = state.form; const valor = num(f.valor);
+  const requiresPhoto = f.tipo !== 'fechado';
   if (!f.client.trim() || isNaN(valor)) { showToast('Preencha cliente e valor'); return; }
+  if (!f.pagamento) { showToast('Selecione a forma de pagamento'); return; }
+  if (requiresPhoto && !state.formPhotoIni) { showToast(f.maquina === 'caminhao' ? 'Foto do odômetro é obrigatória' : 'Foto do horímetro é obrigatória'); return; }
   const svc = {
     id: state.draftId, client: f.client.trim(), contact: f.contact.trim(), tipo: f.tipo, maquina: f.maquina || 'retro',
     valor, horInicial: (f.tipo === 'fechado') ? null : num(f.horimetro), horFinal: null, diarias: null,
@@ -755,7 +917,9 @@ function startService() {
     nf: !!f.nf, nfPercent: f.nf ? state.config.nfPercent : null, pagamento: f.pagamento || '',
     fotoInicial: state.formPhotoIni || null, fotoFinal: null, notaNumero: null
   };
-  state.services.unshift(svc);
+  // se estava editando um rascunho, substitui o registro em vez de duplicar
+  const idx = state.services.findIndex((x) => x.id === svc.id);
+  if (idx === -1) state.services.unshift(svc); else state.services[idx] = svc;
   persistService(svc);
   queueSync('service_created', svc);
   state.screen = 'home'; state.tab = 'andamento';
@@ -770,6 +934,12 @@ function saveEdit() {
   const x = state.services[idx];
   const isFechado = x.status === 'fechado';
   const horInicial = (f.tipo === 'fechado') ? null : num(f.horimetro);
+
+  if (!isFechado) {
+    const requiresPhoto = f.tipo !== 'fechado';
+    if (!f.pagamento) { showToast('Selecione a forma de pagamento'); return; }
+    if (requiresPhoto && !state.formPhotoIni) { showToast(f.maquina === 'caminhao' ? 'Foto do odômetro é obrigatória' : 'Foto do horímetro é obrigatória'); return; }
+  }
 
   let horFinal = x.horFinal, diarias = x.diarias, desconto = x.desconto || 0;
   if (isFechado) {
@@ -799,10 +969,11 @@ function saveEdit() {
     updated.diarias = diarias;
     updated.desconto = desconto;
     updated.fotoFinal = state.formPhotoFim || x.fotoFinal || null;
+    updated.descricao = (f.descricao || '').trim();
   }
 
-  const before = { client: x.client, contact: x.contact, tipo: x.tipo, maquina: x.maquina, valor: x.valor, horInicial: x.horInicial, horFinal: x.horFinal, diarias: x.diarias, desconto: x.desconto, local: x.local, nf: x.nf, pagamento: x.pagamento };
-  const after = { client: updated.client, contact: updated.contact, tipo: updated.tipo, maquina: updated.maquina, valor: updated.valor, horInicial: updated.horInicial, horFinal: updated.horFinal, diarias: updated.diarias, desconto: updated.desconto, local: updated.local, nf: updated.nf, pagamento: updated.pagamento };
+  const before = { client: x.client, contact: x.contact, tipo: x.tipo, maquina: x.maquina, valor: x.valor, horInicial: x.horInicial, horFinal: x.horFinal, diarias: x.diarias, desconto: x.desconto, local: x.local, nf: x.nf, pagamento: x.pagamento, descricao: x.descricao };
+  const after = { client: updated.client, contact: updated.contact, tipo: updated.tipo, maquina: updated.maquina, valor: updated.valor, horInicial: updated.horInicial, horFinal: updated.horFinal, diarias: updated.diarias, desconto: updated.desconto, local: updated.local, nf: updated.nf, pagamento: updated.pagamento, descricao: updated.descricao };
   const changes = diffSummary(before, after, SERVICE_FIELD_LABELS);
 
   state.services[idx] = updated;
@@ -865,14 +1036,56 @@ function closeService() {
 }
 function openNota(id) { state.selectedId = id; state.screen = 'nota'; render(); }
 
-function togglePago(id) {
-  const idx = state.services.findIndex((x) => x.id === id); if (idx === -1) return;
-  const svc = state.services[idx];
-  const updated = { ...svc, pago: !svc.pago };
+/* ---------------------------------------------------------------------- *
+ * Marcar como pago — abre uma tela pedindo data e forma de pagamento,
+ * com opção de cancelar (se clicou sem querer) ou editar (se já estava
+ * pago). Marcar como "não pago" apaga data/forma e volta pra "em aberto".
+ * ---------------------------------------------------------------------- */
+function openMarcarPago(id) {
+  const svc = state.services.find((x) => x.id === id); if (!svc) return;
+  state.selectedId = id;
+  state._pagoReturnScreen = state.screen;
+  state.pagoForm = {
+    data: svc.paidAt ? String(svc.paidAt).slice(0, 10) : new Date().toISOString().slice(0, 10),
+    metodo: svc.paidMethod || ''
+  };
+  state.screen = 'marcar-pago';
+  render();
+}
+function confirmMarcarPago() {
+  const svc = state.services.find((x) => x.id === state.selectedId); if (!svc) return;
+  const f = state.pagoForm;
+  if (!f.data) { showToast('Informe a data do pagamento'); return; }
+  if (!f.metodo) { showToast('Selecione a forma de pagamento'); return; }
+  const before = { pago: svc.pago, paidAt: svc.paidAt || null, paidMethod: svc.paidMethod || null };
+  const updated = { ...svc, pago: true, paidAt: f.data, paidMethod: f.metodo };
+  const after = { pago: updated.pago, paidAt: updated.paidAt, paidMethod: updated.paidMethod };
+  const idx = state.services.findIndex((x) => x.id === svc.id);
   state.services[idx] = updated;
   persistService(updated);
   queueSync('service_updated', updated);
-  addLog((updated.pago ? 'Serviço marcado como pago — ' : 'Serviço marcado como em aberto — ') + svc.client, [`Pago: ${fmtLogVal(svc.pago)} → ${fmtLogVal(updated.pago)}`]);
+  const changes = diffSummary(before, after, SERVICE_FIELD_LABELS);
+  addLog('Serviço marcado como pago — ' + svc.client, changes);
+  state.screen = state._pagoReturnScreen || 'home';
+  render();
+  showToast('Pagamento registrado');
+}
+function marcarNaoPago() {
+  const svc = state.services.find((x) => x.id === state.selectedId); if (!svc) return;
+  const before = { pago: svc.pago, paidAt: svc.paidAt || null, paidMethod: svc.paidMethod || null };
+  const updated = { ...svc, pago: false, paidAt: null, paidMethod: null };
+  const idx = state.services.findIndex((x) => x.id === svc.id);
+  state.services[idx] = updated;
+  persistService(updated);
+  queueSync('service_updated', updated);
+  const changes = diffSummary(before, { pago: false, paidAt: null, paidMethod: null }, SERVICE_FIELD_LABELS);
+  addLog('Serviço marcado como em aberto — ' + svc.client, changes);
+  state.screen = state._pagoReturnScreen || 'home';
+  render();
+  showToast('Pagamento removido — voltou a ficar em aberto');
+}
+function cancelMarcarPago() {
+  state.screen = state._pagoReturnScreen || 'home';
   render();
 }
 
@@ -883,10 +1096,12 @@ function goBack() {
     const svc = state.services.find((x) => x.id === state.editingId);
     state.screen = (svc && svc.status === 'fechado') ? 'nota' : 'detalhe';
   }
+  else if (s === 'novo') { saveDraftIfNeeded(); state.screen = 'home'; state.tab = 'andamento'; }
+  else if (s === 'marcar-pago') { state.screen = state._pagoReturnScreen || 'home'; }
   else if (s === 'config-lock') state.screen = 'home';
   else if (s === 'config') { state.screen = 'home'; state._configBefore = null; }
   else if (s === 'logs') state.screen = 'config';
-  else if (s === 'falhas') state.screen = 'config';
+  else if (s === 'falhas') state.screen = 'home';
   else if (s === 'export-instructions') state.screen = 'home';
   else if (s === 'nota') { state.screen = 'home'; state.tab = 'finalizados'; }
   else state.screen = 'home';
@@ -901,7 +1116,9 @@ function goBack() {
 function computeGaps(maquina) {
   const list = state.services
     .filter((s) => (s.maquina || 'retro') === maquina && s.tipo === 'hora' && s.status === 'fechado' && s.horInicial != null && s.horFinal != null)
-    .slice()
+    // coerção defensiva pra Number: protege contra qualquer dado antigo salvo como string
+    .map((s) => ({ ...s, horInicial: Number(s.horInicial), horFinal: Number(s.horFinal) }))
+    .filter((s) => !isNaN(s.horInicial) && !isNaN(s.horFinal))
     .sort((a, b) => a.horInicial - b.horInicial);
   const gaps = [];
   for (let i = 1; i < list.length; i++) {
@@ -937,7 +1154,8 @@ function saveGapJustification(maquina, deHor, ateHor, texto) {
 const TITLES = {
   novo: 'Novo serviço', editar: 'Editar serviço', detalhe: 'Serviço em andamento', fechar: 'Fechar serviço',
   nota: 'Nota de serviço', config: 'Configurações', 'config-lock': 'Acesso restrito',
-  logs: 'Logs de operações', 'export-instructions': 'Exportar dados', falhas: 'Falhas de horímetro/km'
+  logs: 'Logs de operações', 'export-instructions': 'Exportar dados', falhas: 'Falhas de horímetro/km',
+  'marcar-pago': 'Pagamento'
 };
 
 function headerHtml() {
@@ -947,6 +1165,7 @@ function headerHtml() {
       <img class="logo" src="assets/logo.png" alt="Caterpéu">
       <div class="spacer"></div>
       <button class="icon-btn" data-action="export-data" title="Exportar dados">${ICON.export}</button>
+      <button class="icon-btn" data-action="open-falhas" title="Falhas de horímetro/km">${ICON.warn}</button>
       <button class="icon-btn" data-action="open-config" title="Configurações">${ICON.gear}</button>
     </div>`;
   }
@@ -990,6 +1209,25 @@ function svcCardAndamento(s) {
     <button class="svc-close-btn" data-action="open-fechar" data-id="${s.id}">Fechar serviço</button>
   </div>`;
 }
+function svcCardRascunho(s) {
+  return `<div class="svc-card" data-action="open-draft" data-id="${s.id}">
+    <div class="svc-top">
+      <div class="svc-avatar">${esc(initials(s.client || '?'))}</div>
+      <div class="svc-info">
+        <div class="svc-name">${esc(s.client || 'Sem nome')}</div>
+        <div class="svc-loc">${ICON.pin}<span>${esc(s.local || 'Local não informado')}</span></div>
+      </div>
+      <div class="badge-active" style="background:var(--fieldBg);color:var(--inkSoft);"><span class="dot" style="background:var(--inkSoft);"></span>Rascunho</div>
+    </div>
+    <div class="svc-bottom">
+      <div>
+        <div class="svc-label">Preenchido em</div>
+        <div class="svc-metric mono">${esc(s.startedAt || '')}</div>
+      </div>
+      <button class="btn-sm btn-outline-solid" data-action="delete-draft" data-id="${s.id}" style="color:var(--error);">Excluir</button>
+    </div>
+  </div>`;
+}
 function svcCardFinalizado(s) {
   const v = vm(s);
   return `<div class="svc-card" data-action="open-detalhe" data-id="${s.id}">
@@ -999,7 +1237,7 @@ function svcCardFinalizado(s) {
         <div class="svc-name">${esc(v.client)}</div>
         <div style="font-size:13px;color:var(--inkSoft);margin-top:3px;">${esc(v.tipoLabel)} · ${esc(v.closedAt || '')}</div>
       </div>
-      <button class="paid-toggle ${s.pago ? 'checked' : ''}" data-action="toggle-pago" data-id="${s.id}">
+      <button class="paid-toggle ${s.pago ? 'checked' : ''}" data-action="open-marcar-pago" data-id="${s.id}">
         <span class="box">${s.pago ? ICON.check : ''}</span><span>${s.pago ? 'Pago' : 'Em aberto'}</span>
       </button>
     </div>
@@ -1017,6 +1255,7 @@ function svcCardFinalizado(s) {
 
 function homeScreen() {
   const andamento = state.services.filter((s) => s.status === 'andamento');
+  const rascunhos = state.services.filter((s) => s.status === 'rascunho');
   let finalizados = state.services.filter((s) => s.status === 'fechado');
   const finalizadosTotal = finalizados.length;
   if (state.finFilter === 'pago') finalizados = finalizados.filter((s) => s.pago);
@@ -1029,8 +1268,8 @@ function homeScreen() {
     </div>` : '';
 
   const list = state.tab === 'andamento'
-    ? (andamento.length
-        ? andamento.map(svcCardAndamento).join('')
+    ? ((rascunhos.length || andamento.length)
+        ? rascunhos.map(svcCardRascunho).join('') + andamento.map(svcCardAndamento).join('')
         : `<div class="empty-state"><div class="t">Nenhum serviço aberto</div><div class="s">Toque em "Iniciar serviço" para começar.</div></div>`)
     : (finalizados.length
         ? finalizados.map(svcCardFinalizado).join('')
@@ -1046,7 +1285,7 @@ function homeScreen() {
       ${ICON.chevron}
     </button>
     <div class="tabs">
-      <button class="tab-btn ${state.tab === 'andamento' ? 'active' : ''}" data-action="tab-andamento">Em andamento · ${andamento.length}</button>
+      <button class="tab-btn ${state.tab === 'andamento' ? 'active' : ''}" data-action="tab-andamento">Em andamento · ${andamento.length + rascunhos.length}</button>
       <button class="tab-btn ${state.tab === 'finalizados' ? 'active' : ''}" data-action="tab-finalizados">Finalizados · ${finalizadosTotal}</button>
     </div>
     ${filterRow}
@@ -1067,12 +1306,19 @@ function photoSlotHtml(id, dataUrl, label, targetAction) {
   </div>`;
 }
 
-function formScreen() {
+// Regras de validade do formulário de novo/editar serviço, compartilhadas entre
+// o render completo (formScreen) e os atalhos de digitação em bindEvents (que
+// recalculam a validade sem re-renderizar tudo, pra não perder o foco do campo).
+function computeFormValid() {
   const f = state.form;
   const isEdit = state.screen === 'editar';
   const editingSvc = isEdit ? state.services.find((x) => x.id === state.editingId) : null;
   const isFechadoEdit = !!(editingSvc && editingSvc.status === 'fechado');
-  const cfg = state.config;
+  // Forma de pagamento e foto do horímetro/odômetro só são obrigatórias ao iniciar
+  // um serviço novo (ou editar um que ainda está em andamento) — não ao editar uma
+  // nota já fechada, pra não travar edição de serviços antigos sem essas informações.
+  const requiresInitialFields = !isFechadoEdit;
+  const requiresPhoto = requiresInitialFields && f.tipo !== 'fechado';
   function closingFieldsValid() {
     if (!isFechadoEdit) return true;
     if (f.tipo === 'hora') {
@@ -1082,9 +1328,21 @@ function formScreen() {
     if (f.tipo === 'diaria') return !isNaN(num(f.diarias));
     return true;
   }
-  const valid = f.client.trim() && !isNaN(num(f.valor)) && closingFieldsValid();
+  return !!(f.client.trim() && !isNaN(num(f.valor))
+    && (!requiresInitialFields || !!f.pagamento)
+    && (!requiresPhoto || !!state.formPhotoIni)
+    && closingFieldsValid());
+}
+
+function formScreen() {
+  const f = state.form;
+  const isEdit = state.screen === 'editar';
+  const editingSvc = isEdit ? state.services.find((x) => x.id === state.editingId) : null;
+  const isFechadoEdit = !!(editingSvc && editingSvc.status === 'fechado');
+  const cfg = state.config;
+  const valid = computeFormValid();
   const valorLabel = f.tipo === 'hora' ? (f.maquina === 'caminhao' ? 'Valor do km (R$)' : 'Valor da hora (R$)') : (f.tipo === 'diaria' ? 'Valor da diária (R$)' : 'Valor combinado (R$)');
-  const tipoSectionLabel = f.maquina === 'caminhao' ? 'Tipo de frete' : 'Tipo de serviço';
+  const tipoSectionLabel = f.maquina === 'caminhao' ? 'Tipo de frete' : 'Tipo de cobrança';
   const tipoHoraLabel = f.maquina === 'caminhao' ? 'Por km' : 'Por hora';
   const formHorimetroLabel = f.maquina === 'caminhao' ? 'Km inicial' : 'Horímetro inicial';
   const formFotoLabel = f.maquina === 'caminhao' ? 'Foto do odômetro' : 'Foto do horímetro';
@@ -1168,6 +1426,12 @@ function formScreen() {
       <label>Local do serviço</label>
       <input data-field="form.local" value="${esc(f.local)}" placeholder="Ex: Estrada do Café, km 7 — Patrocínio/MG">
     </div>
+    ${isFechadoEdit ? `
+    <div class="field">
+      <label>Descrição do serviço (opcional)</label>
+      <div class="hint">Se ficar em branco, a nota usa um texto padrão conforme a máquina.</div>
+      <textarea data-field="form.descricao" rows="2" placeholder="Ex: Escavação de valas para tubulação de água">${esc(f.descricao)}</textarea>
+    </div>` : ''}
     <button class="btn ${valid ? 'btn-primary' : 'btn-disabled'}" data-action="form-submit">${isEdit ? 'Salvar alterações' : 'Iniciar serviço'}</button>
   </div>`;
 }
@@ -1184,7 +1448,7 @@ function detalheScreen() {
           <div style="font-weight:800;font-size:18px;line-height:1.15;">${esc(v.client)}</div>
           <div style="font-size:13px;color:var(--inkSoft);margin-top:2px;">${esc(v.contact || 'Contato não informado')}</div>
         </div>
-        ${isFechado ? `<button class="paid-toggle ${s.pago ? 'checked' : ''}" data-action="toggle-pago" data-id="${s.id}"><span class="box">${s.pago ? ICON.check : ''}</span><span>${s.pago ? 'Pago' : 'Em aberto'}</span></button>` : ''}
+        ${isFechado ? `<button class="paid-toggle ${s.pago ? 'checked' : ''}" data-action="open-marcar-pago" data-id="${s.id}"><span class="box">${s.pago ? ICON.check : ''}</span><span>${s.pago ? 'Pago' : 'Em aberto'}</span></button>` : ''}
       </div>
       <div style="display:flex;align-items:center;gap:6px;margin-top:14px;color:var(--inkSoft);font-size:14px;">${ICON.pinBig}<span>${esc(v.local)}</span></div>
       <div class="grid2">
@@ -1196,6 +1460,7 @@ function detalheScreen() {
         ${isFechado && v.isDiaria ? `<div class="cell"><div class="k">Diárias</div><div class="v mono">${esc(v.diarias)}</div></div>` : ''}
         ${isFechado && v.desconto > 0 ? `<div class="cell"><div class="k">Desconto</div><div class="v mono">-${esc(v.descontoFmt)}</div></div>` : ''}
         ${isFechado ? `<div class="cell"><div class="k">Total</div><div class="v mono" style="color:var(--money);">${esc(v.totalFmt)}</div></div>` : ''}
+        ${isFechado && s.pago ? `<div class="cell"><div class="k">Pagamento</div><div class="v">${esc(fmtDateOnly(s.paidAt))}${s.paidMethod ? ' · ' + esc(s.paidMethod[0].toUpperCase() + s.paidMethod.slice(1)) : ''}</div></div>` : ''}
       </div>
       ${v.isHora ? `<div style="margin-top:16px;display:flex;gap:10px;">
         <div style="flex:1;"><div style="font-size:12px;color:var(--inkSoft);font-weight:700;margin-bottom:7px;">${esc(v.fotoIniLabel)}</div>
@@ -1292,6 +1557,7 @@ function notaCardHtml(v, forPrint) {
       <div style="text-align:right;"><div class="nota-k">Data</div><div class="nota-v">${esc(hoje)}</div></div>
     </div>
     ${v.raw.local ? `<div class="nota-local"><span class="nota-k">Local</span><div style="margin-top:3px;">${esc(v.raw.local)}</div></div>` : ''}
+    <div style="font-size:12.5px;color:#6e6a60;font-style:italic;margin-top:10px;">${esc(v.descricao)}</div>
     <div class="nota-table">
       <div class="nota-tr"><span class="l">Tipo de serviço</span><span class="r">${esc(v.tipoLabel)}</span></div>
       ${v.isHora ? `
@@ -1308,6 +1574,11 @@ function notaCardHtml(v, forPrint) {
       <div class="col"><div class="lbl">${esc(v.fotoFimLabel)}</div><div class="photo-small">${v.fotoFinal ? `<img src="${v.fotoFinal}">` : ''}</div></div>
     </div>` : ''}
     <div class="nota-total"><span class="k">TOTAL A PAGAR</span><span class="v">${esc(v.totalFmt)}</span></div>
+    ${(state.config.pixKey || state.pixQrCode) ? `<div class="nota-pix">
+      <div class="nota-k">Pagamento via Pix</div>
+      ${state.config.pixKey ? `<div class="nota-v mono" style="margin-top:3px;">${esc(state.config.pixKey)}</div>` : ''}
+      ${state.pixQrCode ? `<img src="${state.pixQrCode}" alt="QR code Pix">` : ''}
+    </div>` : ''}
   </div>`;
 }
 
@@ -1340,7 +1611,7 @@ function configLockScreen() {
 function configScreen() {
   const cfg = state.config;
   if (!state._configBefore) {
-    state._configBefore = { nfPercent: cfg.nfPercent, valorHoraSugerido: cfg.valorHoraSugerido, payMethods: { ...cfg.payMethods } };
+    state._configBefore = { nfPercent: cfg.nfPercent, valorHoraSugerido: cfg.valorHoraSugerido, pixKey: cfg.pixKey || '', payMethods: { ...cfg.payMethods } };
   }
   if (typeof state._apiUrlDraft !== 'string') state._apiUrlDraft = state.apiUrl || '';
   if (typeof state._pinApiUrlDraft !== 'string') state._pinApiUrlDraft = state.pinApiUrl || '';
@@ -1376,6 +1647,13 @@ function configScreen() {
         </button>`).join('')}
     </div>
 
+    <label class="section-label">Chave Pix</label>
+    <div class="hint">Aparece na nota, junto com o QR code, para o cliente pagar via Pix.</div>
+    <input data-field="config.pixKey" value="${esc(cfg.pixKey || '')}" placeholder="Ex: CNPJ, e-mail, telefone ou chave aleatória" style="width:100%;height:54px;background:var(--fieldBg);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0 16px;font-size:14px;font-weight:500;margin-bottom:12px;">
+    <div class="field" style="max-width:200px;">
+      ${pixQrSlotHtml()}
+    </div>
+
     <label class="section-label">URL da API de validação de PIN</label>
     <input data-field="_pinApiUrlDraft" value="${esc(state._pinApiUrlDraft)}" placeholder="https://seu-sistema/api/validar-pin" style="width:100%;height:54px;background:var(--fieldBg);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0 16px;font-size:14px;font-weight:500;margin-bottom:20px;">
 
@@ -1386,7 +1664,19 @@ function configScreen() {
 
     <button class="btn btn-primary" data-action="save-config">Salvar configurações</button>
     <button class="btn btn-outline-solid" style="margin-top:10px;display:flex;align-items:center;justify-content:center;gap:8px;" data-action="open-logs">${ICON.list}Ver logs de operações</button>
-    <button class="btn btn-outline-solid" style="margin-top:10px;display:flex;align-items:center;justify-content:center;gap:8px;" data-action="open-falhas">${ICON.warn}Ver falhas de horímetro/km</button>
+  </div>`;
+}
+
+function pixQrSlotHtml() {
+  const dataUrl = state.pixQrCode;
+  if (dataUrl) {
+    return `<div class="photo-slot filled" style="height:140px;">
+      <img src="${dataUrl}" alt="">
+      <button class="remove-btn" data-action="pix-qr-remove" title="Remover">${ICON.trash}</button>
+    </div>`;
+  }
+  return `<div class="photo-choice-row">
+    <button class="photo-choice-btn" data-action="pix-qr-gallery">${ICON.gallery}<span>QR code do Pix</span></button>
   </div>`;
 }
 
@@ -1493,8 +1783,34 @@ function screenHtml() {
     case 'logs': return logsScreen();
     case 'falhas': return falhasScreen();
     case 'export-instructions': return exportInstructionsScreen();
+    case 'marcar-pago': return marcarPagoScreen();
     default: return homeScreen();
   }
+}
+
+function marcarPagoScreen() {
+  const svc = state.services.find((x) => x.id === state.selectedId); if (!svc) return '';
+  const f = state.pagoForm;
+  const jaPago = !!svc.pago;
+  return `<div class="screen">
+    <div class="card" style="margin-bottom:16px;">
+      <div style="font-weight:700;font-size:15px;">${esc(svc.client)}</div>
+      <div style="font-size:13px;color:var(--inkSoft);margin-top:2px;">Total: ${esc(fmtBRL(totalOf(svc)))}</div>
+    </div>
+    <div class="field">
+      <label>Data do pagamento</label>
+      <input type="date" data-field="pagoForm.data" value="${esc(f.data)}">
+    </div>
+    <div class="field">
+      <label>Forma de pagamento</label>
+      <div class="pay-row">
+        ${['dinheiro', 'pix', 'cartao', 'cheque'].filter((k) => state.config.payMethods[k]).map((k) => `<button class="chip-btn ${f.metodo === k ? 'active' : ''}" data-action="set-pago-metodo" data-value="${k}">${k[0].toUpperCase() + k.slice(1)}</button>`).join('')}
+      </div>
+    </div>
+    <button class="btn btn-primary" data-action="confirm-marcar-pago">${jaPago ? 'Salvar alterações' : 'Confirmar pagamento'}</button>
+    <button class="btn btn-outline" style="margin-top:10px;" data-action="cancel-marcar-pago">Cancelar</button>
+    ${jaPago ? `<button class="btn btn-outline-solid" style="margin-top:10px;color:var(--error);" data-action="marcar-nao-pago">Marcar como não pago</button>` : ''}
+  </div>`;
 }
 
 function footerHtml() {
@@ -1552,19 +1868,13 @@ function bindEvents() {
       state.form.client = upper;
       if (e.target.value !== upper) { e.target.value = upper; }
       const btn = app.querySelector('[data-action="form-submit"]');
-      if (btn) {
-        const valid = state.form.client.trim() && !isNaN(num(state.form.valor));
-        btn.className = 'btn ' + (valid ? 'btn-primary' : 'btn-disabled');
-      }
+      if (btn) { btn.className = 'btn ' + (computeFormValid() ? 'btn-primary' : 'btn-disabled'); }
       return;
     }
     setByPath(state, field, e.target.value);
     if (field === 'form.valor') {
       const btn = app.querySelector('[data-action="form-submit"]');
-      if (btn) {
-        const valid = state.form.client.trim() && !isNaN(num(state.form.valor));
-        btn.className = 'btn ' + (valid ? 'btn-primary' : 'btn-disabled');
-      }
+      if (btn) { btn.className = 'btn ' + (computeFormValid() ? 'btn-primary' : 'btn-disabled'); }
     }
     if (field === 'closeForm.horimetroFinal' || field === 'closeForm.diarias' || field === 'closeForm.desconto'
         || field === 'form.horimetroFinal' || field === 'form.diarias' || field === 'form.desconto') {
@@ -1575,7 +1885,7 @@ function bindEvents() {
   app.addEventListener('change', (e) => {
     const field = e.target.getAttribute('data-field');
     if (!field) return;
-    if (field === 'logFilterFrom' || field === 'logFilterTo') { setByPath(state, field, e.target.value); render(); }
+    if (field === 'logFilterFrom' || field === 'logFilterTo' || field === 'pagoForm.data') { setByPath(state, field, e.target.value); render(); }
   });
 
   app.addEventListener('click', (e) => {
@@ -1595,20 +1905,38 @@ function bindEvents() {
       case 'tab-andamento': state.tab = 'andamento'; render(); break;
       case 'tab-finalizados': state.tab = 'finalizados'; render(); break;
       case 'fin-filter': state.finFilter = target.getAttribute('data-value'); render(); break;
-      case 'toggle-pago': togglePago(id); break;
+      case 'open-marcar-pago': openMarcarPago(id); break;
+      case 'set-pago-metodo': state.pagoForm.metodo = target.getAttribute('data-value'); render(); break;
+      case 'confirm-marcar-pago': confirmMarcarPago(); break;
+      case 'cancel-marcar-pago': cancelMarcarPago(); break;
+      case 'marcar-nao-pago': marcarNaoPago(); break;
       case 'clear-log-filter': state.logFilterFrom = ''; state.logFilterTo = ''; render(); break;
       case 'open-detalhe': openDetalhe(id); break;
       case 'open-fechar': openFechar(id); break;
       case 'open-nota': openNota(id); break;
       case 'novo': openNovo(); break;
       case 'editar': openEditar(id); break;
+      case 'open-draft': openDraft(id); break;
+      case 'delete-draft': e.stopPropagation(); deleteDraft(id); break;
       case 'toggle-nf': state.form.nf = !state.form.nf; render(); break;
       case 'set-pagamento': state.form.pagamento = target.getAttribute('data-value'); render(); break;
-      case 'set-maquina': state.form.maquina = target.getAttribute('data-value'); render(); break;
+      case 'set-maquina': {
+        const novaMaquina = target.getAttribute('data-value');
+        const wasCaminhao = state.form.maquina === 'caminhao';
+        const sugerido = state.config.valorHoraSugerido != null ? fmtDecimalInput(state.config.valorHoraSugerido) : null;
+        state.form.maquina = novaMaquina;
+        if (novaMaquina === 'caminhao') {
+          // não herda o valor sugerido da hora (retro) pro valor do km (caminhão)
+          if (sugerido != null && state.form.valor === sugerido) state.form.valor = '';
+        } else if (wasCaminhao && !state.form.valor && sugerido != null) {
+          state.form.valor = sugerido;
+        }
+        render(); break;
+      }
       case 'set-tipo': {
         const novoTipo = target.getAttribute('data-value');
         state.form.tipo = novoTipo;
-        if (novoTipo === 'hora' && !state.form.valor && state.config.valorHoraSugerido != null) {
+        if (novoTipo === 'hora' && !state.form.valor && state.form.maquina !== 'caminhao' && state.config.valorHoraSugerido != null) {
           state.form.valor = fmtDecimalInput(state.config.valorHoraSugerido);
         }
         render(); break;
@@ -1647,6 +1975,7 @@ function bindEvents() {
         state.form.maquina = maquina;
         state.form.tipo = 'hora';
         state.form.horimetro = String(de).replace('.', ',');
+        if (maquina === 'caminhao') state.form.valor = ''; // não herda o valor sugerido da hora pro km
         render();
         break;
       }
@@ -1660,6 +1989,8 @@ function bindEvents() {
       case 'photo-form-remove': e.stopPropagation(); state.formPhotoIni = null; render(); break;
       case 'photo-close-remove': e.stopPropagation(); state.closePhotoFim = null; render(); break;
       case 'photo-form-fim-remove': e.stopPropagation(); state.formPhotoFim = null; render(); break;
+      case 'pix-qr-gallery': openPhotoPicker('pix-qr', false); break;
+      case 'pix-qr-remove': state.pixQrCode = null; saveMeta('pixQrCode', null); render(); break;
     }
   });
 
@@ -1670,10 +2001,10 @@ function bindEvents() {
  * Inicialização
  * ---------------------------------------------------------------------- */
 async function loadState() {
-  const [deviceId, userName, config, pinApiUrl, apiUrl, seq, notaCounters, services, logs, syncQueue, gapJustifications] = await Promise.all([
+  const [deviceId, userName, config, pinApiUrl, apiUrl, seq, notaCounters, services, logs, syncQueue, gapJustifications, pixQrCode] = await Promise.all([
     dbGet('meta', 'deviceId'), dbGet('meta', 'userName'), dbGet('meta', 'config'), dbGet('meta', 'pinApiUrl'),
     dbGet('meta', 'apiUrl'), dbGet('meta', 'seq'), dbGet('meta', 'notaCounters'),
-    dbGetAll('services'), dbGetAll('logs'), dbGetAll('syncQueue'), dbGet('meta', 'gapJustifications')
+    dbGetAll('services'), dbGetAll('logs'), dbGetAll('syncQueue'), dbGet('meta', 'gapJustifications'), dbGet('meta', 'pixQrCode')
   ]);
 
   if (deviceId && deviceId.value) state.deviceId = deviceId.value;
@@ -1692,6 +2023,7 @@ async function loadState() {
   state.logs = (logs || []).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   state.syncQueue = syncQueue || [];
   if (gapJustifications && gapJustifications.value) state.gapJustifications = gapJustifications.value;
+  if (pixQrCode && pixQrCode.value) state.pixQrCode = pixQrCode.value;
 }
 
 function registerSW() {

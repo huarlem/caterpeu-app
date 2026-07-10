@@ -1,5 +1,5 @@
 /* Service Worker — Caterpéu (offline-first app shell) */
-const CACHE_NAME = 'caterpeu-cache-v7';
+const CACHE_NAME = 'caterpeu-cache-v9';
 const APP_SHELL = [
   './',
   './index.html',
@@ -30,9 +30,11 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+// Estratégia: cache-first para o app shell e fontes; network-first (com fallback pro cache)
+// para tudo que não é o próprio app — nunca intercepta chamadas de API de sincronização.
 self.addEventListener('fetch', (event) => {
   const req = event.request;
-  if (req.method !== 'GET') return;
+  if (req.method !== 'GET') return; // não intercepta POSTs de sincronização
 
   const url = new URL(req.url);
   const isAppShell = url.origin === self.location.origin;
@@ -46,6 +48,7 @@ self.addEventListener('fetch', (event) => {
       }).catch(() => cached))
     );
   } else {
+    // Google Fonts e outros recursos externos: tenta rede, cai pro cache se offline.
     event.respondWith(
       fetch(req).then((res) => {
         const resClone = res.clone();
