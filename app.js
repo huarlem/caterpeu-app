@@ -16,7 +16,13 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.5.0';
+const APP_VERSION = 'v1.6.0';
+/* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
+   celular já está rodando a versão mais recente depois de uma atualização. */
+const BUILD_STAMP = '09/07/2026 22:00';
+
+/* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
+const DEFAULT_PIX_KEY = '31996055484';
 
 /* ---------------------------------------------------------------------- *
  * Ícones (SVG inline, fiéis ao design)
@@ -480,9 +486,19 @@ function openWhatsAppExport() {
 
 /* ---------------------------------------------------------------------- *
  * Exportação de dados (Web Share API com fallback de download)
+ * O JSON exportado manualmente usa exatamente o mesmo formato de eventos
+ * que é enviado automaticamente pra API (queueSync/trySync) — cada serviço
+ * criado/editado/fechado, cada log e cada justificativa de falha viram um
+ * evento {id, type, payload, device_id, user_name, created_at}. Assim os
+ * dois jeitos de exportar ficam sempre idênticos, sem precisar manter dois
+ * formatos diferentes em paralelo.
  * ---------------------------------------------------------------------- */
 async function exportData() {
-  const data = { empresa: COMPANY.name, exportado_em: new Date().toISOString(), servicos: state.services, logs: state.logs };
+  const eventos = state.syncQueue.map((item) => ({
+    id: item.id, type: item.type, payload: item.payload,
+    device_id: item.device_id, user_name: item.user_name, created_at: item.created_at
+  }));
+  const data = { empresa: COMPANY.name, exportado_em: new Date().toISOString(), device_id: state.deviceId, eventos };
   const json = JSON.stringify(data, null, 2);
   const stamp = new Date().toISOString().slice(0, 10);
   const filename = 'caterpeu-dados-' + stamp + '.json';
@@ -565,15 +581,19 @@ function buildNotaPdfDoc(v) {
   doc.setFontSize(10);
   if (v.raw.local) { doc.text('Local: ' + v.raw.local, marginX, y); y += 7; }
 
-  doc.setFont('helvetica', 'italic');
-  doc.setFontSize(9.5);
-  doc.setTextColor(90, 86, 78);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9);
+  doc.setTextColor(110, 106, 96);
+  doc.text('Serviço', marginX, y);
+  y += 5;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(23, 21, 15);
   const descLines = doc.splitTextToSize(v.descricao, pageWidth - marginX * 2);
   doc.text(descLines, marginX, y);
-  y += descLines.length * 4.5 + 4;
-  doc.setTextColor(23, 21, 15);
+  y += descLines.length * 4.8 + 6;
 
-  const rows = [['Tipo de serviço', v.tipoLabel]];
+  const rows = [['Tipo de cobrança', v.tipoLabel]];
   if (v.isHora) {
     rows.push([v.horInicialLabel, v.horIni]);
     rows.push([v.horFinalLabel, v.horFim]);
@@ -731,9 +751,11 @@ function vm(s) {
     fotoInicial: s.fotoInicial || null, fotoFinal: s.fotoFinal || null,
     notaNumero: s.notaNumero || String(s.id).padStart(4, '0'),
     desconto: s.desconto || 0, descontoFmt: fmtBRL(s.desconto || 0),
-    descricao: (s.descricao && s.descricao.trim())
-      ? s.descricao.trim()
-      : (isCaminhao ? 'Frete caminhão caçamba' : 'Serviço de retroescavadeira'),
+    descricao: (() => {
+      const base = isCaminhao ? 'Frete Caminhão caçamba' : 'Serviço de Retroescavadeira';
+      const extra = (s.descricao && s.descricao.trim()) ? s.descricao.trim() : '';
+      return extra ? (base + ' - ' + extra) : base;
+    })(),
     raw: s
   };
 }
@@ -1557,9 +1579,9 @@ function notaCardHtml(v, forPrint) {
       <div style="text-align:right;"><div class="nota-k">Data</div><div class="nota-v">${esc(hoje)}</div></div>
     </div>
     ${v.raw.local ? `<div class="nota-local"><span class="nota-k">Local</span><div style="margin-top:3px;">${esc(v.raw.local)}</div></div>` : ''}
-    <div style="font-size:12.5px;color:#6e6a60;font-style:italic;margin-top:10px;">${esc(v.descricao)}</div>
+    <div style="margin-top:10px;"><div class="nota-k">Serviço</div><div style="font-size:13px;margin-top:3px;">${esc(v.descricao)}</div></div>
     <div class="nota-table">
-      <div class="nota-tr"><span class="l">Tipo de serviço</span><span class="r">${esc(v.tipoLabel)}</span></div>
+      <div class="nota-tr"><span class="l">Tipo de cobrança</span><span class="r">${esc(v.tipoLabel)}</span></div>
       ${v.isHora ? `
       <div class="nota-tr"><span class="l">${esc(v.horInicialLabel)}</span><span class="r mono">${esc(v.horIni)}</span></div>
       <div class="nota-tr"><span class="l">${esc(v.horFinalLabel)}</span><span class="r mono">${esc(v.horFim)}</span></div>
@@ -1815,7 +1837,7 @@ function marcarPagoScreen() {
 
 function footerHtml() {
   if (state.screen === 'user-setup') return '';
-  return `<div class="app-footer">Desenvolvido por Huarlem Lima · ${esc(APP_VERSION)}</div>`;
+  return `<div class="app-footer">Desenvolvido por Huarlem Lima · ${esc(APP_VERSION)} · ${esc(BUILD_STAMP)}</div>`;
 }
 
 let _lastFocus = null;
@@ -2014,6 +2036,7 @@ async function loadState() {
   else state.screen = 'user-setup';
 
   if (config && config.value) state.config = config.value;
+  if (!state.config.pixKey) { state.config.pixKey = DEFAULT_PIX_KEY; saveMeta('config', state.config); }
   if (pinApiUrl && pinApiUrl.value) state.pinApiUrl = pinApiUrl.value;
   if (apiUrl && apiUrl.value) state.apiUrl = apiUrl.value;
   if (seq && typeof seq.value === 'number') state.seq = seq.value;
