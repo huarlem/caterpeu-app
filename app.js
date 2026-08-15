@@ -16,10 +16,10 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.7.5';
+const APP_VERSION = 'v1.7.6';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '15/08/2026 21:26';
+const BUILD_STAMP = '15/08/2026 22:40';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
@@ -259,6 +259,7 @@ const state = {
   formPhotoFim: null,
   closeForm: { horimetroFinal: '', diarias: '', desconto: '', nf: false },
   closePhotoFim: null,
+  closeDrafts: {},
 
   pagoForm: { data: '', metodo: '' }, _pagoReturnScreen: null,
 
@@ -475,7 +476,7 @@ async function sendWhats(s) {
   const v = vm(s);
   let doc;
   try {
-    doc = buildNotaPdfDoc(v);
+    doc = await buildNotaPdfDoc(v);
   } catch (e) {
     showToast('Não foi possível gerar o PDF');
     return;
@@ -583,7 +584,25 @@ async function exportData() {
  * modo standalone), então window.print() simplesmente não funciona no celular
  * uma vez instalado — só funcionava dentro de uma aba normal do Chrome.
  * ---------------------------------------------------------------------- */
-function buildNotaPdfDoc(v) {
+function getImageDimensions(dataUrl) {
+  return new Promise((resolve) => {
+    try {
+      let done = false;
+      const finish = (dim) => { if (done) return; done = true; clearTimeout(timer); resolve(dim); };
+      // Rede/decodificação de imagem trava em casos raros (arquivo corrompido,
+      // navegador atípico): sem esse limite de tempo o PDF nunca terminaria de
+      // gerar. Depois de 3s, segue com uma proporção padrão.
+      const timer = setTimeout(() => finish({ width: 4, height: 3 }), 3000);
+      const img = new Image();
+      img.onload = () => finish({ width: img.naturalWidth || img.width || 4, height: img.naturalHeight || img.height || 3 });
+      img.onerror = () => finish({ width: 4, height: 3 });
+      img.src = dataUrl;
+    } catch (e) {
+      resolve({ width: 4, height: 3 });
+    }
+  });
+}
+async function buildNotaPdfDoc(v) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: 'mm', format: 'a4' });
   const pageWidth = doc.internal.pageSize.getWidth();
@@ -700,21 +719,34 @@ function buildNotaPdfDoc(v) {
   }
 
   if (v.isHora && (v.fotoInicial || v.fotoFinal)) {
-    const imgW = (pageWidth - marginX * 2 - 6) / 2;
-    const imgH = imgW * 0.7;
-    if (y + imgH + 10 > pageHeight - 14) { doc.addPage(); y = 20; }
+    const slotW = (pageWidth - marginX * 2 - 6) / 2;
+    const maxH = slotW * 0.9;
+    if (y + maxH + 10 > pageHeight - 14) { doc.addPage(); y = 20; }
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(9);
     doc.setTextColor(23, 21, 15);
+    // Cada foto mantém a proporção real (contain-fit dentro do espaço
+    // disponível) em vez de esticar pra um retângulo fixo — isso evita
+    // que fotos em pé (retrato) saiam distorcidas no PDF.
     if (v.fotoInicial) {
       doc.text(v.fotoIniLabel, marginX, y);
-      try { doc.addImage(v.fotoInicial, 'JPEG', marginX, y + 2, imgW, imgH); } catch (e) {}
+      try {
+        const dim = await getImageDimensions(v.fotoInicial);
+        const scale = Math.min(slotW / dim.width, maxH / dim.height);
+        const w = dim.width * scale, h = dim.height * scale;
+        doc.addImage(v.fotoInicial, 'JPEG', marginX, y + 2, w, h);
+      } catch (e) {}
     }
     if (v.fotoFinal) {
-      doc.text(v.fotoFimLabel, marginX + imgW + 6, y);
-      try { doc.addImage(v.fotoFinal, 'JPEG', marginX + imgW + 6, y + 2, imgW, imgH); } catch (e) {}
+      doc.text(v.fotoFimLabel, marginX + slotW + 6, y);
+      try {
+        const dim = await getImageDimensions(v.fotoFinal);
+        const scale = Math.min(slotW / dim.width, maxH / dim.height);
+        const w = dim.width * scale, h = dim.height * scale;
+        doc.addImage(v.fotoFinal, 'JPEG', marginX + slotW + 6, y + 2, w, h);
+      } catch (e) {}
     }
-    y += imgH + 10;
+    y += maxH + 10;
   }
 
   return doc;
@@ -727,7 +759,7 @@ async function downloadPdf(sel) {
   }
   let doc;
   try {
-    doc = buildNotaPdfDoc(sel);
+    doc = await buildNotaPdfDoc(sel);
   } catch (e) {
     showToast('Não foi possível gerar o PDF');
     return;
@@ -1056,8 +1088,11 @@ function openDetalhe(id) { state.selectedId = id; state.screen = 'detalhe'; rend
 function openFechar(id) {
   const svc = state.services.find((x) => x.id === id); if (!svc) return;
   state.selectedId = id; state.screen = 'fechar';
-  state.closeForm = { horimetroFinal: '', diarias: '', desconto: '', nf: !!svc.nf };
-  state.closePhotoFim = null;
+  const draft = state.closeDrafts && state.closeDrafts[id];
+  state.closeForm = draft
+    ? { horimetroFinal: draft.horimetroFinal || '', diarias: draft.diarias || '', desconto: draft.desconto || '', nf: draft.nf != null ? draft.nf : !!svc.nf }
+    : { horimetroFinal: '', diarias: '', desconto: '', nf: !!svc.nf };
+  state.closePhotoFim = (draft && draft.fotoFim) || null;
   render();
 }
 function closeService() {
@@ -1098,10 +1133,28 @@ function closeService() {
   persistService(updated);
   queueSync('service_closed', updated);
   scanAndQueueGaps();
+  if (state.closeDrafts && state.closeDrafts[svc.id]) {
+    delete state.closeDrafts[svc.id];
+    saveMeta('closeDrafts', state.closeDrafts);
+  }
   state.screen = 'nota';
   render();
   showToast('Serviço fechado');
   addLog('Serviço fechado — ' + svc.client + ' — ' + fmtBRL(totalOf(updated)), changes);
+}
+function saveCloseDraftIfNeeded() {
+  const svc = state.services.find((x) => x.id === state.selectedId); if (!svc) return;
+  const cf = state.closeForm;
+  const hasContent = cf.horimetroFinal || cf.diarias || cf.desconto || state.closePhotoFim;
+  if (!hasContent) return;
+  state.closeDrafts = state.closeDrafts || {};
+  state.closeDrafts[svc.id] = {
+    horimetroFinal: cf.horimetroFinal || '', diarias: cf.diarias || '', desconto: cf.desconto || '',
+    nf: !!cf.nf, fotoFim: state.closePhotoFim || null
+  };
+  saveMeta('closeDrafts', state.closeDrafts);
+  showToast('Dados salvos');
+  addLog('Fechamento em andamento salvo — ' + svc.client);
 }
 function openNota(id) { state.selectedId = id; state.screen = 'nota'; render(); }
 
@@ -1160,7 +1213,7 @@ function cancelMarcarPago() {
 
 function goBack() {
   const s = state.screen;
-  if (s === 'fechar') state.screen = 'detalhe';
+  if (s === 'fechar') { saveCloseDraftIfNeeded(); state.screen = 'detalhe'; }
   else if (s === 'editar') {
     const svc = state.services.find((x) => x.id === state.editingId);
     state.screen = (svc && svc.status === 'fechado') ? 'nota' : 'detalhe';
@@ -2116,11 +2169,11 @@ function bindEvents() {
  * Inicialização
  * ---------------------------------------------------------------------- */
 async function loadState() {
-  const [deviceId, userName, config, pinApiUrl, apiUrl, seq, notaCounters, services, logs, syncQueue, gapJustifications, pixQrCode, appVersionSeen, reportedGapKeys] = await Promise.all([
+  const [deviceId, userName, config, pinApiUrl, apiUrl, seq, notaCounters, services, logs, syncQueue, gapJustifications, pixQrCode, appVersionSeen, reportedGapKeys, closeDrafts] = await Promise.all([
     dbGet('meta', 'deviceId'), dbGet('meta', 'userName'), dbGet('meta', 'config'), dbGet('meta', 'pinApiUrl'),
     dbGet('meta', 'apiUrl'), dbGet('meta', 'seq'), dbGet('meta', 'notaCounters'),
     dbGetAll('services'), dbGetAll('logs'), dbGetAll('syncQueue'), dbGet('meta', 'gapJustifications'), dbGet('meta', 'pixQrCode'),
-    dbGet('meta', 'appVersionSeen'), dbGet('meta', 'reportedGapKeys')
+    dbGet('meta', 'appVersionSeen'), dbGet('meta', 'reportedGapKeys'), dbGet('meta', 'closeDrafts')
   ]);
 
   if (deviceId && deviceId.value) state.deviceId = deviceId.value;
@@ -2149,6 +2202,7 @@ async function loadState() {
   });
   if (gapJustifications && gapJustifications.value) state.gapJustifications = gapJustifications.value;
   if (reportedGapKeys && reportedGapKeys.value) state.reportedGapKeys = reportedGapKeys.value;
+  if (closeDrafts && closeDrafts.value) state.closeDrafts = closeDrafts.value;
   if (pixQrCode && pixQrCode.value) state.pixQrCode = pixQrCode.value;
   // Avisa quando o app foi atualizado desde o último acesso (mesmo dispositivo).
   // Na primeira vez que essa checagem existe (sem valor salvo ainda), não há
