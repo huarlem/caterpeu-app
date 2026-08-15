@@ -16,10 +16,10 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.7.4';
+const APP_VERSION = 'v1.7.5';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '15/08/2026 20:56';
+const BUILD_STAMP = '15/08/2026 21:26';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
@@ -225,6 +225,7 @@ const state = {
   tab: 'andamento',
   selectedId: null, draftId: null, editingId: null,
   toast: null, _toastTimer: null,
+  updateAvailable: false, _waitingWorker: null,
 
   deviceId: null, userName: null, userNameInput: '', userSetupReturnScreen: 'home',
   config: {
@@ -396,7 +397,7 @@ function fileToCompressedDataURL(file) {
     reader.onload = () => {
       const img = new Image();
       img.onload = () => {
-        const maxDim = 1280;
+        const maxDim = 1000;
         let { width, height } = img;
         if (width > maxDim || height > maxDim) {
           if (width > height) { height = Math.round(height * maxDim / width); width = maxDim; }
@@ -406,7 +407,7 @@ function fileToCompressedDataURL(file) {
         canvas.width = width; canvas.height = height;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', 0.82));
+        resolve(canvas.toDataURL('image/jpeg', 0.6));
       };
       img.onerror = reject;
       img.src = reader.result;
@@ -1910,6 +1911,22 @@ function marcarPagoScreen() {
   </div>`;
 }
 
+/* Faixa fixa avisando que já tem uma versão nova baixada, esperando confirmação
+ * pra ativar (ver sw.js: instala em segundo plano mas só troca quando o usuário
+ * confirmar, tocando aqui — nunca troca sozinho no meio do uso). */
+function updateBannerHtml() {
+  if (!state.updateAvailable) return '';
+  return `<div class="update-banner" data-action="apply-update">Nova versão disponível — toque para atualizar</div>`;
+}
+
+function applyUpdate() {
+  if (state._waitingWorker) {
+    try { state._waitingWorker.postMessage('skipWaiting'); } catch (e) {}
+  }
+  state.updateAvailable = false;
+  render();
+}
+
 function footerHtml() {
   if (state.screen === 'user-setup') return '';
   return `<div class="app-footer">Desenvolvido por Huarlem Lima · ${esc(APP_VERSION)} · ${esc(BUILD_STAMP)}</div>`;
@@ -1923,7 +1940,7 @@ function render() {
   const activeField = active && active.getAttribute ? active.getAttribute('data-field') : null;
   const selStart = active && 'selectionStart' in active ? active.selectionStart : null;
 
-  app.innerHTML = headerHtml() + screenHtml() + footerHtml() + (state.toast ? `<div class="toast-wrap"><div class="toast">${ICON.toastCheck}${esc(state.toast)}</div></div>` : '');
+  app.innerHTML = updateBannerHtml() + headerHtml() + screenHtml() + footerHtml() + (state.toast ? `<div class="toast-wrap"><div class="toast">${ICON.toastCheck}${esc(state.toast)}</div></div>` : '');
 
   if (activeField) {
     const el = app.querySelector(`[data-field="${activeField}"]`);
@@ -2052,6 +2069,7 @@ function bindEvents() {
         render(); break;
       }
       case 'save-config': saveConfig(); render(); break;
+      case 'apply-update': applyUpdate(); break;
       case 'open-logs': state.screen = 'logs'; render(); break;
       case 'open-falhas': scanAndQueueGaps(); state.screen = 'falhas'; render(); break;
       case 'toggle-fechar-nf': state.closeForm.nf = !state.closeForm.nf; render(); break;
@@ -2146,10 +2164,44 @@ async function loadState() {
   scanAndQueueGaps();
 }
 
+/* ---------------------------------------------------------------------- *
+ * Service Worker + detecção de atualização
+ * O sw.js instala a versão nova em segundo plano mas fica esperando (não
+ * ativa sozinho) — só troca quando o usuário toca na faixa "Nova versão
+ * disponível" (updateBannerHtml/applyUpdate). Isso evita recarregar a
+ * página no meio de uma ação sem avisar.
+ * ---------------------------------------------------------------------- */
 function registerSW() {
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
-  }
+  if (!('serviceWorker' in navigator)) return;
+
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    // já tinha uma atualização baixada e esperando de antes de abrir o app agora
+    if (reg.waiting && navigator.serviceWorker.controller) {
+      state._waitingWorker = reg.waiting;
+      state.updateAvailable = true;
+      render();
+    }
+    reg.addEventListener('updatefound', () => {
+      const newWorker = reg.installing;
+      if (!newWorker) return;
+      newWorker.addEventListener('statechange', () => {
+        // só avisa se já havia um SW controlando a página antes (senão é a
+        // primeira instalação do app, não uma atualização)
+        if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+          state._waitingWorker = newWorker;
+          state.updateAvailable = true;
+          render();
+        }
+      });
+    });
+  }).catch(() => {});
+
+  let _reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (_reloaded) return;
+    _reloaded = true;
+    window.location.reload();
+  });
 }
 
 async function init() {

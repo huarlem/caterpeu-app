@@ -21,6 +21,11 @@ button{-webkit-appearance:none;appearance:none;}
 
 #app{min-height:100vh;display:flex;flex-direction:column;background:var(--bg);max-width:520px;margin:0 auto;position:relative;}
 
+/* ---------- Faixa de atualização disponível ---------- */
+.update-banner{background:var(--accent);color:var(--accentInk);text-align:center;font-weight:700;font-size:13.5px;
+  padding:12px 16px;cursor:pointer;line-height:1.35;}
+.update-banner:active{opacity:.85;}
+
 .mono{font-family:'Spline Sans Mono',monospace;}
 
 /* ---------- Header ---------- */

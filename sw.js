@@ -1,5 +1,5 @@
 /* Service Worker — Caterpéu (offline-first app shell) */
-const CACHE_NAME = 'caterpeu-cache-v16';
+const CACHE_NAME = 'caterpeu-cache-v17';
 const APP_SHELL = [
   './',
   './index.html',
@@ -18,8 +18,16 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME)
       .then((cache) => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
   );
+  // Não chama mais self.skipWaiting() aqui: a versão nova fica instalada e
+  // esperando (estado "waiting"), só ativa quando o usuário confirmar —
+  // tocando na faixa "Nova versão disponível" no app.js — via a mensagem
+  // 'skipWaiting' tratada abaixo. Isso evita trocar a versão sozinha no
+  // meio do uso, sem avisar.
+});
+
+self.addEventListener('message', (event) => {
+  if (event.data === 'skipWaiting') self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
