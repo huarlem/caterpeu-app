@@ -16,10 +16,10 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.7.6';
+const APP_VERSION = 'v1.7.7';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '15/08/2026 22:40';
+const BUILD_STAMP = '15/08/2026 23:30';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
@@ -588,19 +588,67 @@ function getImageDimensions(dataUrl) {
   return new Promise((resolve) => {
     try {
       let done = false;
-      const finish = (dim) => { if (done) return; done = true; clearTimeout(timer); resolve(dim); };
+      const finish = (result) => { if (done) return; done = true; clearTimeout(timer); resolve(result); };
       // Rede/decodificação de imagem trava em casos raros (arquivo corrompido,
       // navegador atípico): sem esse limite de tempo o PDF nunca terminaria de
-      // gerar. Depois de 3s, segue com uma proporção padrão.
-      const timer = setTimeout(() => finish({ width: 4, height: 3 }), 3000);
+      // gerar. Depois de 3s, segue com uma proporção padrão e sem foto normalizada
+      // (buildNotaPdfDoc cai de volta pro dado original nesse caso — ver abaixo).
+      const timer = setTimeout(() => finish({ width: 4, height: 3, dataUrl: null }), 3000);
       const img = new Image();
-      img.onload = () => finish({ width: img.naturalWidth || img.width || 4, height: img.naturalHeight || img.height || 3 });
-      img.onerror = () => finish({ width: 4, height: 3 });
+      img.onload = () => {
+        const natW = img.naturalWidth || img.width || 4;
+        const natH = img.naturalHeight || img.height || 3;
+        // Redesenha num <canvas> e reexporta como JPEG "limpo" (baseline, sem
+        // metadados, tamanho limitado) — o parser de JPEG do jsPDF (usado em
+        // doc.addImage) é bem mais simples que o decodificador nativo do
+        // navegador, e uma foto de câmera em resolução total (sem nunca ter
+        // passado pela compressão do upload) é pesada demais pro PDF num
+        // celular de campo. Era exatamente o caso das fotos de ordens de
+        // serviço antigas: a miniatura aparecia normal na tela de detalhes
+        // (o <img> decodifica sem problema), mas doc.addImage() falhava por
+        // baixo dos panos (silenciosamente, dentro de um try/catch) e a foto
+        // não saía no PDF. Teto de 1600px: maior que o da compressão no
+        // upload (1000px, ver fileToCompressedDataURL) pra não perder
+        // qualidade de fotos antigas, mas ainda limitado pra não gerar um
+        // PDF gigante com foto de câmera em resolução total.
+        try {
+          const maxDim = 1600;
+          let width = natW, height = natH;
+          if (width > maxDim || height > maxDim) {
+            if (width > height) { height = Math.round(height * maxDim / width); width = maxDim; }
+            else { width = Math.round(width * maxDim / height); height = maxDim; }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width; canvas.height = height;
+          canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+          finish({ width, height, dataUrl: canvas.toDataURL('image/jpeg', 0.85) });
+        } catch (e) {
+          finish({ width: natW, height: natH, dataUrl: null });
+        }
+      };
+      img.onerror = () => finish({ width: 4, height: 3, dataUrl: null });
       img.src = dataUrl;
     } catch (e) {
-      resolve({ width: 4, height: 3 });
+      resolve({ width: 4, height: 3, dataUrl: null });
     }
   });
+}
+/* Caixinha "Foto indisponível" — usada só se getImageDimensions() +
+ * doc.addImage() falharem mesmo depois da normalização (caso extremo: os
+ * dois try/catch de cima já cobrem quase tudo). Deixa visível que a foto
+ * existia mas não pôde ser embutida, em vez de um espaço em branco sem
+ * explicação nenhuma. */
+function drawPhotoUnavailable(doc, x, y, w, h) {
+  try {
+    doc.setDrawColor(214, 209, 199);
+    doc.setFillColor(248, 246, 242);
+    doc.roundedRect(x, y, w, h, 2, 2, 'FD');
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.setTextColor(150, 145, 135);
+    doc.text('Foto indisponível', x + w / 2, y + h / 2, { align: 'center' });
+    doc.setTextColor(23, 21, 15);
+  } catch (e) {}
 }
 async function buildNotaPdfDoc(v) {
   const { jsPDF } = window.jspdf;
@@ -727,15 +775,24 @@ async function buildNotaPdfDoc(v) {
     doc.setTextColor(23, 21, 15);
     // Cada foto mantém a proporção real (contain-fit dentro do espaço
     // disponível) em vez de esticar pra um retângulo fixo — isso evita
-    // que fotos em pé (retrato) saiam distorcidas no PDF.
+    // que fotos em pé (retrato) saiam distorcidas no PDF. getImageDimensions()
+    // também normaliza a foto (redesenha num canvas, com teto de 1600px, e
+    // reexporta como JPEG limpo) antes de mandar pro jsPDF — sem isso, fotos
+    // de ordens de serviço antigas (de antes da compressão no upload)
+    // ficavam de fora do PDF silenciosamente, mesmo aparecendo normal na
+    // tela de detalhes. Se ainda assim a foto não puder ser embutida,
+    // desenha uma caixinha "Foto indisponível" (drawPhotoUnavailable) em vez
+    // de deixar um espaço em branco sem explicação.
     if (v.fotoInicial) {
       doc.text(v.fotoIniLabel, marginX, y);
       try {
         const dim = await getImageDimensions(v.fotoInicial);
         const scale = Math.min(slotW / dim.width, maxH / dim.height);
         const w = dim.width * scale, h = dim.height * scale;
-        doc.addImage(v.fotoInicial, 'JPEG', marginX, y + 2, w, h);
-      } catch (e) {}
+        doc.addImage(dim.dataUrl || v.fotoInicial, 'JPEG', marginX, y + 2, w, h);
+      } catch (e) {
+        drawPhotoUnavailable(doc, marginX, y + 2, slotW, maxH);
+      }
     }
     if (v.fotoFinal) {
       doc.text(v.fotoFimLabel, marginX + slotW + 6, y);
@@ -743,8 +800,10 @@ async function buildNotaPdfDoc(v) {
         const dim = await getImageDimensions(v.fotoFinal);
         const scale = Math.min(slotW / dim.width, maxH / dim.height);
         const w = dim.width * scale, h = dim.height * scale;
-        doc.addImage(v.fotoFinal, 'JPEG', marginX + slotW + 6, y + 2, w, h);
-      } catch (e) {}
+        doc.addImage(dim.dataUrl || v.fotoFinal, 'JPEG', marginX + slotW + 6, y + 2, w, h);
+      } catch (e) {
+        drawPhotoUnavailable(doc, marginX + slotW + 6, y + 2, slotW, maxH);
+      }
     }
     y += maxH + 10;
   }
