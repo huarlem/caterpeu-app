@@ -16,10 +16,10 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.7.8';
+const APP_VERSION = 'v1.7.9';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '16/08/2026 15:00';
+const BUILD_STAMP = '16/08/2026 15:40';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
@@ -99,6 +99,18 @@ function nowLabelSec() {
   const d = new Date();
   const hh = String(d.getHours()).padStart(2, '0'), mm = String(d.getMinutes()).padStart(2, '0'), ss = String(d.getSeconds()).padStart(2, '0');
   return 'Hoje · ' + hh + ':' + mm + ':' + ss;
+}
+// Data de CRIAÇÃO da ordem de serviço (não a de geração do PDF/nota) —
+// usa startedAtISO (campo novo, gravado desde a criação) com fallback pra
+// startedAt (registros antigos podem ter só esse campo, e como ISO em vez
+// do rótulo 'Hoje · HH:MM'); só cai pra hoje se nenhuma das duas for uma
+// data válida. new Date(null) vira 1/1/1970 em vez de Invalid Date, por
+// isso o valor bruto precisa ser truthy antes de tentar.
+function resolveOrderDate(raw) {
+  let d = raw.startedAtISO ? new Date(raw.startedAtISO) : null;
+  if ((!d || isNaN(d.getTime())) && raw.startedAt) d = new Date(raw.startedAt);
+  if (!d || isNaN(d.getTime())) d = new Date();
+  return d;
 }
 function fmtLogVal(v) {
   if (v == null || v === '') return '—';
@@ -650,6 +662,32 @@ function drawPhotoUnavailable(doc, x, y, w, h) {
     doc.setTextColor(23, 21, 15);
   } catch (e) {}
 }
+let _logoDataUrlPromise = null;
+// Carrega assets/logo.png como data URL (uma vez, com cache em memória) pra
+// poder embutir no PDF via doc.addImage — diferente das fotos do usuário,
+// aqui não faz sentido reencodar via canvas (perderia a transparência do
+// PNG), só ler os bytes originais direto. Se falhar (offline sem cache,
+// etc.), buildNotaPdfDoc cai pro nome da empresa em texto, igual era antes.
+function getLogoDataUrl() {
+  if (_logoDataUrlPromise) return _logoDataUrlPromise;
+  const attempt = fetch('assets/logo.png')
+    .then((r) => r.blob())
+    .then((blob) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    }))
+    .catch(() => null);
+  // só cacheia o SUCESSO — se falhar (ex: offline sem o asset em cache),
+  // limpa o cache pra tentar de novo na próxima nota, em vez de ficar
+  // preso no fallback de texto pelo resto da sessão.
+  _logoDataUrlPromise = attempt.then((result) => {
+    if (!result) _logoDataUrlPromise = null;
+    return result;
+  });
+  return _logoDataUrlPromise;
+}
 async function buildNotaPdfDoc(v) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: 'mm', format: 'a4' });
@@ -658,25 +696,35 @@ async function buildNotaPdfDoc(v) {
   const marginX = 18;
   let y = 20;
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(16);
-  doc.text(COMPANY.name, marginX, y);
+  // Cabeçalho igual à visualização da nota no app: logo à esquerda (com
+  // fallback pro nome da empresa em texto se a imagem não carregar).
+  let logoDrawn = false;
+  try {
+    const logoDataUrl = await getLogoDataUrl();
+    if (logoDataUrl) {
+      const logoH = 10, logoW = logoH * (1925 / 800);
+      doc.addImage(logoDataUrl, 'PNG', marginX, y - 8, logoW, logoH);
+      logoDrawn = true;
+    }
+  } catch (e) {}
+  if (!logoDrawn) {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text(COMPANY.name, marginX, y);
+  }
 
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(12);
   doc.text('Nota Nº ' + v.notaNumero, pageWidth - marginX, y - 2, { align: 'right' });
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);
-  let dataOS = v.raw.startedAtISO ? new Date(v.raw.startedAtISO) : null;
-  if ((!dataOS || isNaN(dataOS.getTime())) && v.raw.startedAt) dataOS = new Date(v.raw.startedAt);
-  if (!dataOS || isNaN(dataOS.getTime())) dataOS = new Date();
-  doc.text('Data: ' + dataOS.toLocaleDateString('pt-BR'), pageWidth - marginX, y + 4, { align: 'right' });
+  doc.text('Data: ' + resolveOrderDate(v.raw).toLocaleDateString('pt-BR'), pageWidth - marginX, y + 4, { align: 'right' });
 
   y += 6;
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9.5);
   doc.setTextColor(110, 106, 96);
-  doc.text('CNPJ ' + COMPANY.cnpj, marginX, y); y += 4.5;
+  doc.text(COMPANY.name + ' · CNPJ ' + COMPANY.cnpj, marginX, y); y += 4.5;
   doc.text(COMPANY.region, marginX, y); y += 4.5;
   doc.text(COMPANY.phones, marginX, y);
   doc.setTextColor(23, 21, 15);
@@ -733,42 +781,6 @@ async function buildNotaPdfDoc(v) {
     y += 6.5;
   });
 
-  y += 6;
-  doc.setDrawColor(23, 21, 15);
-  doc.setLineWidth(0.6);
-  doc.line(marginX, y, pageWidth - marginX, y);
-  doc.setLineWidth(0.2);
-  y += 9;
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(13.5);
-  doc.text('TOTAL A PAGAR', marginX, y);
-  doc.text(v.totalFmt, pageWidth - marginX, y, { align: 'right' });
-  y += 12;
-
-  if (state.config.pixKey || state.pixQrCode) {
-    const qrSize = 30;
-    const blockH = Math.max(state.pixQrCode ? qrSize : 0, 14) + 4;
-    if (y + blockH > pageHeight - 14) { doc.addPage(); y = 20; }
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(10.5);
-    doc.setTextColor(23, 21, 15);
-    doc.text('Pagamento via Pix', marginX, y);
-    y += 6;
-    let pixTextY = y;
-    if (state.config.pixKey) {
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(10);
-      doc.text('Chave: ' + state.config.pixKey, marginX, pixTextY);
-      pixTextY += 6;
-    }
-    if (state.pixQrCode) {
-      try { doc.addImage(state.pixQrCode, imgFormatFromDataUrl(state.pixQrCode), marginX, y, qrSize, qrSize); } catch (e) {}
-      y += qrSize + 8;
-    } else {
-      y = pixTextY + 4;
-    }
-  }
-
   if (v.isHora && (v.fotoInicial || v.fotoFinal)) {
     const slotW = (pageWidth - marginX * 2 - 6) / 2;
     const maxH = slotW * 0.9;
@@ -809,6 +821,42 @@ async function buildNotaPdfDoc(v) {
       }
     }
     y += maxH + 10;
+  }
+
+  y += 6;
+  doc.setDrawColor(23, 21, 15);
+  doc.setLineWidth(0.6);
+  doc.line(marginX, y, pageWidth - marginX, y);
+  doc.setLineWidth(0.2);
+  y += 9;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13.5);
+  doc.text('TOTAL A PAGAR', marginX, y);
+  doc.text(v.totalFmt, pageWidth - marginX, y, { align: 'right' });
+  y += 12;
+
+  if (state.config.pixKey || state.pixQrCode) {
+    const qrSize = 30;
+    const blockH = Math.max(state.pixQrCode ? qrSize : 0, 14) + 4;
+    if (y + blockH > pageHeight - 14) { doc.addPage(); y = 20; }
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10.5);
+    doc.setTextColor(23, 21, 15);
+    doc.text('Pagamento via Pix', marginX, y);
+    y += 6;
+    let pixTextY = y;
+    if (state.config.pixKey) {
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(10);
+      doc.text('Chave: ' + state.config.pixKey, marginX, pixTextY);
+      pixTextY += 6;
+    }
+    if (state.pixQrCode) {
+      try { doc.addImage(state.pixQrCode, imgFormatFromDataUrl(state.pixQrCode), marginX, y, qrSize, qrSize); } catch (e) {}
+      y += qrSize + 8;
+    } else {
+      y = pixTextY + 4;
+    }
   }
 
   return doc;
@@ -1754,7 +1802,7 @@ function fecharScreen() {
 }
 
 function notaCardHtml(v, forPrint) {
-  const hoje = new Date().toLocaleDateString('pt-BR');
+  const hoje = resolveOrderDate(v.raw).toLocaleDateString('pt-BR');
   return `<div id="${forPrint ? '' : 'nota-card'}" class="nota-card">
     <div class="nota-top">
       <img src="assets/logo.png" alt="Caterpéu">
