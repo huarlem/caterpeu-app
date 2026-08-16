@@ -16,10 +16,10 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v1.7.7';
+const APP_VERSION = 'v1.7.8';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '15/08/2026 23:30';
+const BUILD_STAMP = '16/08/2026 15:00';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
@@ -667,7 +667,10 @@ async function buildNotaPdfDoc(v) {
   doc.text('Nota Nº ' + v.notaNumero, pageWidth - marginX, y - 2, { align: 'right' });
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);
-  doc.text('Data: ' + new Date().toLocaleDateString('pt-BR'), pageWidth - marginX, y + 4, { align: 'right' });
+  let dataOS = v.raw.startedAtISO ? new Date(v.raw.startedAtISO) : null;
+  if ((!dataOS || isNaN(dataOS.getTime())) && v.raw.startedAt) dataOS = new Date(v.raw.startedAt);
+  if (!dataOS || isNaN(dataOS.getTime())) dataOS = new Date();
+  doc.text('Data: ' + dataOS.toLocaleDateString('pt-BR'), pageWidth - marginX, y + 4, { align: 'right' });
 
   y += 6;
   doc.setFont('helvetica', 'normal');
