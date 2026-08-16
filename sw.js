@@ -1,5 +1,5 @@
 /* Service Worker — Caterpéu (offline-first app shell) */
-const CACHE_NAME = 'caterpeu-cache-v21';
+const CACHE_NAME = 'caterpeu-cache-v22';
 const APP_SHELL = [
   './',
   './index.html',
@@ -8,6 +8,7 @@ const APP_SHELL = [
   './manifest.json',
   './lib/jspdf.umd.min.js',
   './assets/logo.png',
+  './assets/pix-qr-default.png',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/icon-192-maskable.png',
