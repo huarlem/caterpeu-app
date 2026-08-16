@@ -1,5 +1,5 @@
 /* Service Worker — Caterpéu (offline-first app shell) */
-const CACHE_NAME = 'caterpeu-cache-v22';
+const CACHE_NAME = 'caterpeu-cache-v23';
 const APP_SHELL = [
   './',
   './index.html',

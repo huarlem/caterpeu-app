@@ -16,10 +16,10 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v22';
+const APP_VERSION = 'v23';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '16/08/2026 16:10';
+const BUILD_STAMP = '16/08/2026 17:00';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
@@ -354,7 +354,7 @@ async function trySync() {
       try {
         const res = await fetch(state.apiUrl, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
           body: JSON.stringify(toOutboundEvent(item))
         });
         if (res.ok) { item.synced_at = new Date().toISOString(); await dbPut('syncQueue', item); }
