@@ -16,19 +16,16 @@ const COMPANY = {
 };
 
 /* Versão exibida no rodapé — incrementar a cada novo deploy. */
-const APP_VERSION = 'v23';
+const APP_VERSION = 'v24';
 /* Data/hora deste build — atualizar a cada novo deploy, ajuda a confirmar que o
    celular já está rodando a versão mais recente depois de uma atualização. */
-const BUILD_STAMP = '16/08/2026 17:00';
+const BUILD_STAMP = '16/08/2026 17:30';
 
 /* Chave Pix padrão, usada até que o usuário configure a sua em Configurações. */
 const DEFAULT_PIX_KEY = '31996055484';
 
-/* URL padrão da API de sincronização, usada até que o usuário configure outra em Configurações. */
+/* URL da API de sincronização — fixa, não editável pelo usuário (ver "Funcionalidades já implementadas" no CLAUDE.md). */
 const DEFAULT_API_URL = 'https://personal-475f6p4v-dev.outsystems.app/CaterpeuServiceManagement/rest/BackupAPI/sincronize';
-/* Default anterior (v1.7.1 a v1.7.3) — usado só pra migrar quem já tinha recebido
- * esse valor automaticamente, sem mexer em URL que o usuário tenha digitado à mão. */
-const PREVIOUS_DEFAULT_API_URLS = ['https://personal-rbvlxhjp-dev.outsystems.app/CaterpeuServiceManagement/api/backup/sincronize'];
 
 /* QR code Pix padrão: carregado de assets/pix-qr-default.png em tempo de execução
  * (ver getDefaultPixQrDataUrl / loadAssetDataUrl) — não fica mais embutido como base64
@@ -249,8 +246,7 @@ const state = {
     valorHoraSugerido: 250
   },
   pixQrCode: null,
-  pinApiUrl: '',
-  apiUrl: '',
+  apiUrl: DEFAULT_API_URL,
   seq: 0,
   notaCounters: {},
   services: [],
@@ -260,7 +256,7 @@ const state = {
   reportedGapKeys: [],
   _gapDrafts: {},
 
-  configPassInput: '', configUnlockError: null, _configBefore: null,
+  _configBefore: null,
   lastExportFilename: '',
 
   finFilter: 'todos',
@@ -391,17 +387,6 @@ function nextNotaNumero() {
 }
 
 /* ---------------------------------------------------------------------- *
- * Autenticação de admin (PIN fixo configurável + fallback por data)
- * ---------------------------------------------------------------------- */
-function adminPasswordToday() {
-  const d = new Date();
-  const dd = String(d.getDate()).padStart(2, '0');
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const yy = String(d.getFullYear()).slice(-2);
-  return dd + mm + yy;
-}
-
-/* ---------------------------------------------------------------------- *
  * Captura de foto (câmera ou galeria) com compressão
  * ---------------------------------------------------------------------- */
 function fileToCompressedDataURL(file) {
@@ -410,7 +395,7 @@ function fileToCompressedDataURL(file) {
     reader.onload = () => {
       const img = new Image();
       img.onload = () => {
-        const maxDim = 1000;
+        const maxDim = 500;
         let { width, height } = img;
         if (width > maxDim || height > maxDim) {
           if (width > height) { height = Math.round(height * maxDim / width); width = maxDim; }
@@ -620,7 +605,7 @@ function getImageDimensions(dataUrl) {
         // (o <img> decodifica sem problema), mas doc.addImage() falhava por
         // baixo dos panos (silenciosamente, dentro de um try/catch) e a foto
         // não saía no PDF. Teto de 1600px: maior que o da compressão no
-        // upload (1000px, ver fileToCompressedDataURL) pra não perder
+        // upload (500px, ver fileToCompressedDataURL) pra não perder
         // qualidade de fotos antigas, mas ainda limitado pra não gerar um
         // PDF gigante com foto de câmera em resolução total.
         try {
@@ -854,7 +839,17 @@ async function buildNotaPdfDoc(v) {
       pixTextY += 6;
     }
     if (state.pixQrCode) {
-      try { doc.addImage(state.pixQrCode, imgFormatFromDataUrl(state.pixQrCode), marginX, y, qrSize, qrSize); } catch (e) {}
+      // Mesma normalização das fotos do horímetro (getImageDimensions):
+      // sem isso, o addImage falha silenciosamente pra QR codes enviados
+      // pelo usuário num formato/tamanho que o parser do jsPDF não aceita
+      // (mesmo aparecendo normal na visualização da nota, decodificada pelo
+      // navegador) — o QR simplesmente não saía no PDF, sem nenhum aviso.
+      try {
+        const dim = await getImageDimensions(state.pixQrCode);
+        doc.addImage(dim.dataUrl || state.pixQrCode, dim.dataUrl ? 'JPEG' : imgFormatFromDataUrl(state.pixQrCode), marginX, y, qrSize, qrSize);
+      } catch (e) {
+        drawPhotoUnavailable(doc, marginX, y, qrSize, qrSize);
+      }
       y += qrSize + 8;
     } else {
       y = pixTextY + 4;
@@ -878,36 +873,22 @@ async function downloadPdf(sel) {
   }
   const filename = 'nota-' + sel.notaNumero + '.pdf';
 
-  let shared = false;
-  if (navigator.share && navigator.canShare) {
+  // Sempre baixa de verdade (doc.save) — não usa navigator.share aqui, pra não
+  // ficar idêntico ao botão "Enviar no WhatsApp" (esse sim compartilha, ver
+  // sendWhats()). "Baixar PDF" precisa fazer só uma coisa: colocar o arquivo
+  // no aparelho.
+  try {
+    doc.save(filename);
+    showToast('PDF baixado: ' + filename);
+  } catch (e) {
+    // último recurso: abre o PDF numa aba nova a partir de uma data URI.
     try {
-      const blob = doc.output('blob');
-      const file = new File([blob], filename, { type: 'application/pdf' });
-      if (navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: 'Nota de serviço — ' + sel.client });
-        shared = true;
-      }
-    } catch (e) {
-      if (e && e.name === 'AbortError') shared = true; // usuário cancelou deliberadamente
+      window.open(doc.output('bloburl'), '_blank');
+      showToast('PDF aberto numa nova aba');
+    } catch (e2) {
+      showToast('Não foi possível baixar o PDF');
+      return;
     }
-  }
-
-  if (!shared) {
-    try {
-      doc.save(filename);
-      showToast('PDF baixado: ' + filename);
-    } catch (e) {
-      // último recurso: abre o PDF numa aba nova a partir de uma data URI.
-      try {
-        window.open(doc.output('bloburl'), '_blank');
-        showToast('PDF aberto numa nova aba');
-      } catch (e2) {
-        showToast('Não foi possível baixar o PDF');
-        return;
-      }
-    }
-  } else {
-    showToast('PDF compartilhado');
   }
   addLog('PDF da nota gerado — ' + sel.client);
 }
@@ -962,39 +943,8 @@ function saveUserName() {
   showToast('Usuário identificado como "' + name + '"');
 }
 
-function openConfigLock() { state.screen = 'config-lock'; state.configPassInput = ''; state.configUnlockError = null; state.configChecking = false; render(); }
-
-async function submitConfigPassword() {
-  const input = state.configPassInput;
-
-  // Senha do dia: sempre válida, funciona 100% offline — é a recuperação de emergência.
-  if (input === adminPasswordToday()) { unlockConfig(); return; }
-
-  // PIN validado por API externa (quando configurada e houver internet).
-  if (state.pinApiUrl && navigator.onLine) {
-    state.configChecking = true; render();
-    try {
-      const res = await fetch(state.pinApiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin: input, device_id: state.deviceId })
-      });
-      state.configChecking = false;
-      if (res.ok) {
-        const data = await res.json().catch(() => ({}));
-        if (data && data.valid) { unlockConfig(); return; }
-      }
-    } catch (e) {
-      state.configChecking = false;
-      // API falhou/offline — só a senha do dia (já verificada acima) funciona.
-    }
-  }
-
-  state.configUnlockError = 'Senha incorreta';
-  render();
-}
 function unlockConfig() {
-  state.screen = 'config'; state.configPassInput = ''; state.configUnlockError = null; state.configChecking = false;
+  state.screen = 'config';
   state._configBefore = null; // força capturar um novo "antes" ao entrar na tela
   addLog('Acesso às configurações');
   render();
@@ -1021,15 +971,6 @@ function saveConfig() {
   const vh = num(String(state._valorHoraDraft != null ? state._valorHoraDraft : (state.config.valorHoraSugerido || '')));
   state.config.valorHoraSugerido = isNaN(vh) ? null : vh;
 
-  if (typeof state._pinApiUrlDraft === 'string') {
-    state.pinApiUrl = state._pinApiUrlDraft.trim();
-    saveMeta('pinApiUrl', state.pinApiUrl);
-  }
-  if (typeof state._apiUrlDraft === 'string') {
-    state.apiUrl = state._apiUrlDraft.trim();
-    saveMeta('apiUrl', state.apiUrl);
-  }
-
   const afterCfg = { nfPercent: state.config.nfPercent, valorHoraSugerido: state.config.valorHoraSugerido, ...state.config.payMethods };
   const changes = diffSummary(beforeCfg, afterCfg, { nfPercent: 'Acréscimo NF (%)', valorHoraSugerido: 'Valor/hora sugerido', dinheiro: 'Dinheiro', pix: 'Pix', cartao: 'Cartão', cheque: 'Cheque' });
 
@@ -1052,6 +993,7 @@ function openNovo() {
   state.formPhotoIni = null;
   state.formPhotoFim = null;
   state.screen = 'novo';
+  state._gapFillTarget = null; // limpa qualquer intenção de preencher buraco de um "Abrir nota de serviço" anterior não concluído
   render();
 }
 function openEditar(id) {
@@ -1082,6 +1024,7 @@ function openDraft(id) {
   };
   state.formPhotoIni = d.fotoInicial || null;
   state.formPhotoFim = null;
+  state._gapFillTarget = null;
   render();
 }
 function saveDraftIfNeeded() {
@@ -1129,6 +1072,14 @@ function startService() {
     nf: !!f.nf, nfPercent: f.nf ? state.config.nfPercent : null, pagamento: f.pagamento || '',
     fotoInicial: state.formPhotoIni || null, fotoFinal: null, notaNumero: null
   };
+  // se esse "novo serviço" veio de "Abrir nota de serviço" numa falha de
+  // horímetro/km (tela Falhas), guarda a referência do buraco NO PRÓPRIO
+  // serviço — sobrevive até o fechamento (pode levar dias), diferente de um
+  // estado solto que se perderia se o operador abrir outro serviço no meio.
+  if (state._gapFillTarget) {
+    svc.gapFill = { maquina: svc.maquina, deHor: state._gapFillTarget.deHor, ateHor: state._gapFillTarget.ateHor };
+    state._gapFillTarget = null;
+  }
   // se estava editando um rascunho, substitui o registro em vez de duplicar
   const idx = state.services.findIndex((x) => x.id === svc.id);
   if (idx === -1) state.services.unshift(svc); else state.services[idx] = svc;
@@ -1235,6 +1186,11 @@ function closeService() {
   patch.notaNumero = svc.notaNumero || nextNotaNumero();
   const idx = state.services.findIndex((x) => x.id === svc.id);
   const updated = { ...svc, ...patch };
+  // se esse serviço foi aberto via "Abrir nota de serviço" numa falha de
+  // horímetro/km (ver startService), a referência do buraco fica guardada
+  // aqui até agora — o número da nota só existe a partir do fechamento.
+  const gapFillToJustify = updated.gapFill || null;
+  if (updated.gapFill) delete updated.gapFill;
 
   const before = { status: svc.status, horFinal: svc.horFinal, diarias: svc.diarias, nf: svc.nf, desconto: svc.desconto };
   const after = { status: updated.status, horFinal: updated.horFinal, diarias: updated.diarias, nf: updated.nf, desconto: updated.desconto };
@@ -1245,6 +1201,9 @@ function closeService() {
   persistService(updated);
   queueSync('service_closed', updated);
   scanAndQueueGaps();
+  if (gapFillToJustify && !findJustification(gapFillToJustify)) {
+    saveGapJustification(gapFillToJustify.maquina, gapFillToJustify.deHor, gapFillToJustify.ateHor, 'Nota de serviço nº ' + updated.notaNumero + ' foi aberta para cobrir esse intervalo.');
+  }
   if (state.closeDrafts && state.closeDrafts[svc.id]) {
     delete state.closeDrafts[svc.id];
     saveMeta('closeDrafts', state.closeDrafts);
@@ -1332,7 +1291,6 @@ function goBack() {
   }
   else if (s === 'novo') { saveDraftIfNeeded(); state.screen = 'home'; state.tab = 'andamento'; }
   else if (s === 'marcar-pago') { state.screen = state._pagoReturnScreen || 'home'; }
-  else if (s === 'config-lock') state.screen = 'home';
   else if (s === 'config') { state.screen = 'home'; state._configBefore = null; }
   else if (s === 'logs') state.screen = 'config';
   else if (s === 'falhas') state.screen = 'home';
@@ -1416,7 +1374,7 @@ function scanAndQueueGaps() {
  * ---------------------------------------------------------------------- */
 const TITLES = {
   novo: 'Novo serviço', editar: 'Editar serviço', detalhe: 'Serviço em andamento', fechar: 'Fechar serviço',
-  nota: 'Nota de serviço', config: 'Configurações', 'config-lock': 'Acesso restrito',
+  nota: 'Nota de serviço', config: 'Configurações',
   logs: 'Logs de operações', 'export-instructions': 'Exportar dados', falhas: 'Falhas de horímetro/km',
   'marcar-pago': 'Pagamento'
 };
@@ -1558,8 +1516,10 @@ function homeScreen() {
 
 function photoSlotHtml(id, dataUrl, label, targetAction) {
   if (dataUrl) {
+    // Tocar na miniatura já refaz a foto direto (câmera) — antes só dava pra
+    // trocar removendo primeiro (botão de lixeira) e escolhendo de novo.
     return `<div class="photo-slot filled">
-      <img src="${dataUrl}" alt="">
+      <img src="${dataUrl}" alt="" data-action="${targetAction}-camera" title="Toque para tirar outra foto" style="cursor:pointer;">
       <button class="remove-btn" data-action="${targetAction}-remove" title="Remover">${ICON.trash}</button>
     </div>`;
   }
@@ -1858,26 +1818,11 @@ function notaScreen() {
   </div>`;
 }
 
-function configLockScreen() {
-  return `<div class="screen centered-tight">
-    <div style="width:64px;height:64px;border-radius:18px;background:var(--chipBg);color:var(--chipInk);display:flex;align-items:center;justify-content:center;margin-bottom:18px;">${ICON.lock}</div>
-    <div style="font-weight:800;font-size:18px;">Acesso restrito</div>
-    <div style="font-size:13.5px;color:var(--inkSoft);margin-top:6px;margin-bottom:22px;line-height:1.5;">Digite a senha de administrador para abrir as configurações.</div>
-    <input id="config-pass-input" data-field="configPassInput" value="${esc(state.configPassInput)}" type="password" inputmode="numeric" placeholder="Senha" style="width:100%;height:54px;background:var(--fieldBg);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0 16px;font-size:18px;font-weight:600;text-align:center;letter-spacing:.1em;">
-    ${state.configUnlockError ? `<div style="color:var(--error);font-size:13px;font-weight:700;margin-top:10px;">${esc(state.configUnlockError)}</div>` : ''}
-    ${state.configChecking ? `<div style="color:var(--inkSoft);font-size:13px;font-weight:600;margin-top:10px;">Verificando...</div>` : ''}
-    <button class="btn btn-primary" style="margin-top:22px;" data-action="config-pass-submit">Entrar</button>
-    <button class="btn btn-outline" style="margin-top:10px;" data-action="back">Voltar</button>
-  </div>`;
-}
-
 function configScreen() {
   const cfg = state.config;
   if (!state._configBefore) {
     state._configBefore = { nfPercent: cfg.nfPercent, valorHoraSugerido: cfg.valorHoraSugerido, payMethods: { ...cfg.payMethods } };
   }
-  if (typeof state._apiUrlDraft !== 'string') state._apiUrlDraft = state.apiUrl || '';
-  if (typeof state._pinApiUrlDraft !== 'string') state._pinApiUrlDraft = state.pinApiUrl || '';
   if (typeof state._valorHoraDraft !== 'string') state._valorHoraDraft = cfg.valorHoraSugerido != null ? fmtDecimalInput(cfg.valorHoraSugerido) : '';
   return `<div class="screen">
     <div class="user-row">
@@ -1916,12 +1861,7 @@ function configScreen() {
       ${pixQrSlotHtml()}
     </div>
 
-    <label class="section-label">URL da API de validação de PIN</label>
-    <input data-field="_pinApiUrlDraft" value="${esc(state._pinApiUrlDraft)}" placeholder="https://seu-sistema/api/validar-pin" style="width:100%;height:54px;background:var(--fieldBg);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0 16px;font-size:14px;font-weight:500;margin-bottom:20px;">
-
-    <label class="section-label">URL da API para sincronização (Sistema Web)</label>
-    <div class="hint">Quando configurado, o app envia serviços e logs automaticamente sempre que houver internet. Deixe em branco para usar só localmente.</div>
-    <input data-field="_apiUrlDraft" value="${esc(state._apiUrlDraft)}" placeholder="https://seu-sistema/api/caterpeu" style="width:100%;height:54px;background:var(--fieldBg);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0 16px;font-size:14px;font-weight:500;margin-bottom:6px;">
+    <label class="section-label">Sincronização</label>
     <div id="sync-badge" style="font-size:12px;color:var(--inkSoft);margin-bottom:20px;"></div>
 
     <button class="btn btn-primary" data-action="save-config">Salvar configurações</button>
@@ -1963,7 +1903,7 @@ function falhasScreen() {
                 <input data-field="_gapDraft:${key}" value="${esc(draft)}" placeholder="Ex: Deslocamento, levado ao mecânico..." style="width:100%;height:44px;background:var(--fieldBg);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:0 12px;font-size:13.5px;margin-bottom:8px;">
                 <div style="display:flex;gap:8px;">
                   <button class="btn-sm btn-outline-solid" data-action="gap-justify" data-key="${key}" data-maquina="${g.maquina}" data-de="${g.deHor}" data-ate="${g.ateHor}">Salvar justificativa</button>
-                  <button class="btn-sm btn-whats" data-action="gap-open-novo" data-maquina="${g.maquina}" data-de="${g.deHor}">Abrir nota de serviço</button>
+                  <button class="btn-sm btn-whats" data-action="gap-open-novo" data-maquina="${g.maquina}" data-de="${g.deHor}" data-ate="${g.ateHor}">Abrir nota de serviço</button>
                 </div>
               </div>`}
         </div>`;
@@ -2040,7 +1980,6 @@ function screenHtml() {
     case 'detalhe': return detalheScreen();
     case 'fechar': return fecharScreen();
     case 'nota': return notaScreen();
-    case 'config-lock': return configLockScreen();
     case 'config': return configScreen();
     case 'logs': return logsScreen();
     case 'falhas': return falhasScreen();
@@ -2176,10 +2115,9 @@ function bindEvents() {
       case 'save-user-name': saveUserName(); break;
       case 'cancel-user-setup': state.screen = state.userSetupReturnScreen || 'home'; render(); break;
       case 'export-data': exportData(); break;
-      case 'open-config': openConfigLock(); break;
+      case 'open-config': unlockConfig(); break;
       case 'open-whatsapp-export': openWhatsAppExport(); break;
       case 'back': goBack(); break;
-      case 'config-pass-submit': submitConfigPassword(); break;
       case 'tab-andamento': state.tab = 'andamento'; render(); break;
       case 'tab-finalizados': state.tab = 'finalizados'; render(); break;
       case 'fin-filter': state.finFilter = target.getAttribute('data-value'); render(); break;
@@ -2250,11 +2188,16 @@ function bindEvents() {
       case 'gap-open-novo': {
         const maquina = target.getAttribute('data-maquina');
         const de = Number(target.getAttribute('data-de'));
+        const ate = Number(target.getAttribute('data-ate'));
         openNovo();
         state.form.maquina = maquina;
         state.form.tipo = 'hora';
         state.form.horimetro = String(de).replace('.', ',');
         if (maquina === 'caminhao') state.form.valor = ''; // não herda o valor sugerido da hora pro km
+        // guarda a intenção até o serviço ser criado (startService) — de lá em
+        // diante, fica salva NO PRÓPRIO serviço (svc.gapFill), não aqui, pra
+        // sobreviver mesmo que o serviço demore dias pra ser fechado.
+        state._gapFillTarget = { deHor: de, ateHor: ate };
         render();
         break;
       }
@@ -2280,9 +2223,9 @@ function bindEvents() {
  * Inicialização
  * ---------------------------------------------------------------------- */
 async function loadState() {
-  const [deviceId, userName, config, pinApiUrl, apiUrl, seq, notaCounters, services, logs, syncQueue, gapJustifications, pixQrCode, appVersionSeen, reportedGapKeys, closeDrafts] = await Promise.all([
-    dbGet('meta', 'deviceId'), dbGet('meta', 'userName'), dbGet('meta', 'config'), dbGet('meta', 'pinApiUrl'),
-    dbGet('meta', 'apiUrl'), dbGet('meta', 'seq'), dbGet('meta', 'notaCounters'),
+  const [deviceId, userName, config, seq, notaCounters, services, logs, syncQueue, gapJustifications, pixQrCode, appVersionSeen, reportedGapKeys, closeDrafts] = await Promise.all([
+    dbGet('meta', 'deviceId'), dbGet('meta', 'userName'), dbGet('meta', 'config'),
+    dbGet('meta', 'seq'), dbGet('meta', 'notaCounters'),
     dbGetAll('services'), dbGetAll('logs'), dbGetAll('syncQueue'), dbGet('meta', 'gapJustifications'), dbGet('meta', 'pixQrCode'),
     dbGet('meta', 'appVersionSeen'), dbGet('meta', 'reportedGapKeys'), dbGet('meta', 'closeDrafts')
   ]);
@@ -2294,13 +2237,6 @@ async function loadState() {
   else state.screen = 'user-setup';
 
   if (config && config.value) state.config = config.value;
-  if (!state.pixQrCode) {
-    const defaultQr = await getDefaultPixQrDataUrl();
-    if (defaultQr) { state.pixQrCode = defaultQr; saveMeta('pixQrCode', state.pixQrCode); }
-  }
-  if (pinApiUrl && pinApiUrl.value) state.pinApiUrl = pinApiUrl.value;
-  if (apiUrl && apiUrl.value) state.apiUrl = apiUrl.value;
-  if (!state.apiUrl || PREVIOUS_DEFAULT_API_URLS.includes(state.apiUrl)) { state.apiUrl = DEFAULT_API_URL; saveMeta('apiUrl', state.apiUrl); }
   if (seq && typeof seq.value === 'number') state.seq = seq.value;
   if (notaCounters && notaCounters.value) state.notaCounters = notaCounters.value;
 
@@ -2317,6 +2253,13 @@ async function loadState() {
   if (reportedGapKeys && reportedGapKeys.value) state.reportedGapKeys = reportedGapKeys.value;
   if (closeDrafts && closeDrafts.value) state.closeDrafts = closeDrafts.value;
   if (pixQrCode && pixQrCode.value) state.pixQrCode = pixQrCode.value;
+  // só busca o QR padrão se NADA estiver salvo ainda — precisa rodar DEPOIS
+  // de carregar o valor salvo acima, senão sobrescreve (e persiste!) por
+  // cima de um QR customizado que o usuário já tinha subido em Configurações.
+  if (!state.pixQrCode) {
+    const defaultQr = await getDefaultPixQrDataUrl();
+    if (defaultQr) { state.pixQrCode = defaultQr; saveMeta('pixQrCode', state.pixQrCode); }
+  }
   // Avisa quando o app foi atualizado desde o último acesso (mesmo dispositivo).
   // Na primeira vez que essa checagem existe (sem valor salvo ainda), não há
   // versão anterior confiável pra comparar, então só passa a registrar a partir
